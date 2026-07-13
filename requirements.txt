@@ -16,3 +16,26 @@ nest-asyncio>=1.5.0
 
 # Loader dependencies used by PyPDFLoader
 pypdf==6.14.2
+
+# Enterprise API and persistence
+fastapi>=0.115.0,<0.129.0
+uvicorn[standard]>=0.30.0,<0.40.0
+SQLAlchemy>=2.0.36,<3.0
+PyMySQL>=1.1.1,<2.0
+alembic>=1.14.0,<1.17.0
+python-multipart>=0.0.18,<0.0.21
+python-jose[cryptography]>=3.3.0,<4.0
+passlib[argon2]>=1.7.4,<2.0
+argon2-cffi>=23.1.0,<26.0
+
+# Async jobs and object storage
+celery[redis]>=5.4.0,<6.0
+redis>=5.2.0,<7.0
+minio>=7.2.12,<8.0
+requests>=2.32.0,<3.0
+
+# Tests and quality
+pytest>=8.3.0,<9.0
+httpx>=0.28.0,<1.0
+ruff>=0.9.0,<1.0
+mypy>=1.14.0,<2.0
