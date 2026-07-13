@@ -42,7 +42,8 @@ flowchart LR
     Activate --> Ready["current_version_id 指向 ready 版本"]
 
     Query["POST /api/v1/queries"] --> Versions["active_versions_for_user"]
-    Versions --> Search["LangGraph: 初次授权检索"]
+    Versions --> Preprocess["LangGraph: Query 预处理"]
+    Preprocess --> Search["多查询初次授权检索"]
     Search --> Grade["LangGraph: 重排与相关性评分"]
     Grade --> Enough{"证据足够？"}
     Enough -->|是| Generate["LangGraph: 生成与引用校验"]
@@ -67,13 +68,14 @@ flowchart LR
 
 1. `POST /api/v1/queries` 只接收 `question` 和可选的 `conversation_uuid`；客户端不能传部门 ID、文档 ID 或 Milvus 过滤表达式。
 2. `RAGService.answer` 通过 `active_versions_for_user` 解析当前用户可访问的活跃版本。MySQL 是授权事实来源。
-3. LangGraph 首个节点执行 Milvus 检索，`MilvusChunkStore.search` 对问题做 Embedding，并应用表达式：`version_uuid in [...]`。
-4. `grade_documents` 先进行内置候选重排：过滤空内容和可选低分候选、按标准化内容去重、按分数排序、限制单文档 chunk 数；然后按配置决定是否执行 LLM 相关性评分。
-5. 如果相关证据不足且尚未补救，`rewrite_and_retrieve` 用 LLM 生成最多 2 个查询改写，并且只在同一组授权版本 UUID 内二次检索。二次候选按 `chunk_id` 合并去重，同一 chunk 保留最高分。
-6. `generate` 只基于授权证据生成中文答案，并校验答案中的 `[n]` 引用。无引用或越界引用会严格重试一次；仍失败则返回 `refusal_reason = invalid_citations`。
-7. `RAGService._citations` 只返回答案实际引用的 chunks，而不是全部候选证据。
-8. 用户消息和助手消息会持久化，助手消息包含引用、模型名、`trace_id` 和耗时指标。
-9. `query.execute` 审计日志记录 trace ID、是否拒答和引用数量。
+3. `preprocess_query` 在初次检索前按配置执行 Query 预处理，生成去重后的检索查询列表；用户原始问题保持不变，仍用于最终答案生成。
+4. `retrieve` 对预处理后的查询逐个执行 Milvus 检索。`MilvusChunkStore.search` 对查询做 Embedding，并应用表达式：`version_uuid in [...]`。多查询结果按 `chunk_id` 合并，同一 chunk 保留最高分。
+5. `grade_documents` 先按 `RERANKER_TYPE` 选择候选重排策略，然后按配置决定是否执行 LLM 相关性评分。内置默认重排会过滤空内容和可选低分候选、按标准化内容去重、按分数排序、限制单文档 chunk 数。
+6. 如果相关证据不足且尚未补救，`rewrite_and_retrieve` 再次使用 Query 预处理器生成新的 corrective 查询，并且只在同一组授权版本 UUID 内二次检索。二次候选按 `chunk_id` 合并去重。
+7. `generate` 只基于授权证据生成中文答案，并校验答案中的 `[n]` 引用。无引用或越界引用会严格重试一次；仍失败则返回 `refusal_reason = invalid_citations`。
+8. `RAGService._citations` 只返回答案实际引用的 chunks，而不是全部候选证据。
+9. 用户消息和助手消息会持久化，助手消息包含引用、模型名、`trace_id` 和耗时指标。
+10. `query.execute` 审计日志记录 trace ID、是否拒答和引用数量。
 
 ## 授权不变量
 
@@ -84,6 +86,62 @@ flowchart LR
 - 授权证据缺失或不足时，生成阶段返回结构化拒答，`refusal_reason = insufficient_authorized_evidence`。
 - 查询改写不会访问外部网络，也不会改变授权版本集合。
 - 答案缺少有效引用时返回结构化拒答，`refusal_reason = invalid_citations`。
+
+## Query 预处理
+
+`QUERY_REWRITE_TYPES` 支持按顺序组合以下类型：
+
+| 策略 | 解决的核心问题 | 额外开销 | 适合场景 |
+| --- | --- | --- | --- |
+| `direct` | 口语化、指代不清、问题表达不完整 | 1 次 LLM 调用 | 用户问题较短、口语化或上下文表达不清 |
+| `hyde` | 用户问题与知识库文档的表达风格差异较大 | 1 次 LLM 调用 | 专业知识库、文档语言与提问语言差异明显 |
+| `step_back` | 具体问题需要背景知识、概念或原理支撑 | 1 次 LLM 调用 | 技术文档、规范、原理性问题 |
+| `multi_query` | 单一查询角度覆盖不全 | 1 次 LLM 调用生成多个查询 | 答案涉及多个维度的复杂问题 |
+
+此外还支持：
+
+- `normalize`：本地规则清洗，去除首尾空白并合并连续空白，不调用 LLM。
+- `standalone`：`direct` 的兼容别名，旧配置可继续使用。
+
+预处理结果遵循以下规则：
+
+- 第一项始终是规范化后的用户原问题。
+- 查询按规范化文本去重。
+- 初次检索最多使用 `QUERY_REWRITE_MAX_QUERIES` 个查询。默认启用 `normalize,direct,multi_query`，HyDE 和 Step-back 建议按知识库场景显式开启。
+- corrective 检索最多使用 `QUERY_REWRITE_CORRECTIVE_MAX_QUERIES` 个尚未检索过的新查询。
+- LLM 改写失败时保留规范化原问题，不中断 RAG 请求。
+- 所有查询只用于检索；最终生成仍使用用户原始问题。
+
+## Reranker 策略
+
+`RERANKER_TYPE` 控制候选重排实现：
+
+- `default`：默认策略。使用本地规则过滤、去重、按向量分数排序，并限制单文档 chunk 数。
+- `identity`：不做重排，按检索返回顺序继续后续评分和生成，主要用于排障或对比实验。
+- `external`：调用外部 reranker HTTP 接口，根据模型返回分数重排候选；接口失败或配置为空时回退到 `default` 策略。
+
+外部 reranker 请求格式：
+
+```json
+{
+  "model": "optional-reranker-model",
+  "query": "用户问题",
+  "documents": ["候选 chunk 文本 1", "候选 chunk 文本 2"]
+}
+```
+
+响应支持 `results` 或 `data` 数组，每项至少包含候选下标和分数：
+
+```json
+{
+  "results": [
+    {"index": 1, "relevance_score": 0.98},
+    {"index": 0, "relevance_score": 0.31}
+  ]
+}
+```
+
+鉴权使用 `RERANKER_API_KEY`，以 `Authorization: Bearer ...` 发送。
 
 ## Milvus Chunk 结构
 
@@ -110,6 +168,14 @@ flowchart LR
 - `EMBEDDING_DIMENSION`
 - `RELEVANCE_MAX_CONCURRENCY`
 - `RELEVANCE_GRADING_ENABLED`
+- `QUERY_REWRITE_ENABLED`
+- `QUERY_REWRITE_TYPES`
+- `QUERY_REWRITE_MAX_QUERIES`
+- `QUERY_REWRITE_CORRECTIVE_MAX_QUERIES`
+- `RERANKER_TYPE`
+- `RERANKER_ENDPOINT`
+- `RERANKER_API_KEY`
+- `RERANKER_MODEL`
 - `RETRIEVAL_CANDIDATE_COUNT`
 - `RETRIEVAL_MIN_SCORE`
 - `RETRIEVAL_MAX_CHUNKS_PER_DOCUMENT`
@@ -133,6 +199,9 @@ flowchart LR
 - `RAGService.answer` 在 fake vector store 和 fake model gateway 下的主链路。
 - 授权版本 UUID 传递、消息持久化、完整 timings 持久化。
 - 候选过滤、去重、排序和单文档 chunk 限额。
+- Reranker 配置选择和外部 reranker 请求/排序。
+- Query normalize、direct、HyDE、Step-back、多查询扩展、配置组合和结果去重。
+- 初检前多查询授权检索，以及证据不足后的 corrective 查询扩展。
 - 引用校验、严格重试、只返回实际引用 chunks 和 `invalid_citations` 拒答。
 - 初次证据不足时的一轮查询改写、二次授权检索和候选合并去重。
 

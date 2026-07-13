@@ -1,9 +1,9 @@
 import os
 from functools import lru_cache
-from typing import List, Optional
+from typing import Annotated, List, Optional
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -48,6 +48,20 @@ class Settings(BaseSettings):
 
     relevance_max_concurrency: int = 4
     relevance_grading_enabled: bool = True
+    query_rewrite_enabled: bool = True
+    query_rewrite_types: Annotated[List[str], NoDecode] = Field(
+        default_factory=lambda: [
+            "normalize",
+            "direct",
+            "multi_query",
+        ]
+    )
+    query_rewrite_max_queries: int = 3
+    query_rewrite_corrective_max_queries: int = 2
+    reranker_type: str = "default"
+    reranker_endpoint: str = ""
+    reranker_api_key: str = ""
+    reranker_model: str = ""
     retrieval_candidate_count: int = 10
     retrieval_min_score: Optional[float] = None
     retrieval_max_chunks_per_document: int = 3
@@ -94,6 +108,45 @@ class Settings(BaseSettings):
         if value == "":
             return None
         return value
+
+    @field_validator("reranker_type")
+    @classmethod
+    def supported_reranker_type(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"default", "identity", "external"}:
+            raise ValueError("reranker_type must be default, identity, or external")
+        return normalized
+
+    @field_validator("query_rewrite_types", mode="before")
+    @classmethod
+    def split_query_rewrite_types(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @field_validator("query_rewrite_types")
+    @classmethod
+    def supported_query_rewrite_types(cls, value: List[str]) -> List[str]:
+        supported = {
+            "normalize",
+            "direct",
+            "hyde",
+            "step_back",
+            "multi_query",
+        }
+        aliases = {"standalone": "direct"}
+        normalized = []
+        for item in value:
+            rewrite_type = item.strip().lower()
+            rewrite_type = aliases.get(rewrite_type, rewrite_type)
+            if rewrite_type not in supported:
+                raise ValueError(
+                    "query_rewrite_types must contain normalize, direct, hyde, "
+                    "step_back, or multi_query"
+                )
+            if rewrite_type not in normalized:
+                normalized.append(rewrite_type)
+        return normalized or ["normalize"]
 
     def configure_langsmith(self) -> None:
         os.environ["LANGCHAIN_TRACING_V2"] = (

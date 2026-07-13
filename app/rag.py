@@ -4,8 +4,9 @@ import threading
 import time
 import uuid
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Protocol, Sequence, TypedDict, Union
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, TypedDict, Union
 
+import requests
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
@@ -13,7 +14,7 @@ from langgraph.graph import END, StateGraph
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.models import (
     Conversation,
     Document,
@@ -28,12 +29,14 @@ from app.vector_store import MilvusChunkStore
 
 class RAGState(TypedDict, total=False):
     question: str
+    queries: List[str]
     version_uuids: List[str]
     candidates: List[Dict[str, Any]]
     relevant: List[Dict[str, Any]]
     answer: str
     cited_indices: List[int]
     corrective_attempted: bool
+    query_rewrite_attempted: bool
     refused: bool
     refusal_reason: Optional[str]
     timings: Dict[str, float]
@@ -78,10 +81,29 @@ class RAGModelGateway(Protocol):
     def rewrite_queries(self, question: str, count: int = 2) -> List[str]:
         ...
 
+    def rewrite_query(self, question: str) -> str:
+        ...
+
+    def generate_hypothetical_document(self, question: str) -> str:
+        ...
+
+    def rewrite_step_back_query(self, question: str) -> str:
+        ...
+
+
+class QueryPreprocessor(Protocol):
+    def preprocess(
+        self,
+        question: str,
+        model_gateway: RAGModelGateway,
+        max_queries: Optional[int] = None,
+    ) -> List[str]:
+        ...
+
 
 class CandidateReranker(Protocol):
     def rerank(
-        self, candidates: Sequence[Dict[str, Any]]
+        self, question: str, candidates: Sequence[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
         ...
 
@@ -96,7 +118,7 @@ class DefaultCandidateReranker:
         self.max_chunks_per_document = max(1, max_chunks_per_document)
 
     def rerank(
-        self, candidates: Sequence[Dict[str, Any]]
+        self, question: str, candidates: Sequence[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
         deduped: Dict[str, Dict[str, Any]] = {}
         for candidate in candidates:
@@ -130,9 +152,195 @@ class DefaultCandidateReranker:
 
 class IdentityCandidateReranker:
     def rerank(
-        self, candidates: Sequence[Dict[str, Any]]
+        self, question: str, candidates: Sequence[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
         return list(candidates)
+
+
+class ExternalCandidateReranker:
+    def __init__(
+        self,
+        endpoint: str,
+        model: str = "",
+        api_key: str = "",
+        timeout_seconds: int = 45,
+        fallback: Optional[CandidateReranker] = None,
+        post: Optional[Callable[..., Any]] = None,
+    ) -> None:
+        self.endpoint = endpoint
+        self.model = model
+        self.api_key = api_key
+        self.timeout_seconds = timeout_seconds
+        self.fallback = fallback or DefaultCandidateReranker()
+        self.post = post or requests.post
+
+    def rerank(
+        self, question: str, candidates: Sequence[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        if not self.endpoint or not candidates:
+            return self.fallback.rerank(question, candidates)
+        documents = [str(candidate.get("content") or "") for candidate in candidates]
+        payload: Dict[str, Any] = {
+            "query": question,
+            "documents": documents,
+        }
+        if self.model:
+            payload["model"] = self.model
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        try:
+            response = self.post(
+                self.endpoint,
+                json=payload,
+                headers=headers,
+                timeout=self.timeout_seconds,
+            )
+            response.raise_for_status()
+            scores = self._parse_scores(response.json(), len(candidates))
+        except Exception:
+            return self.fallback.rerank(question, candidates)
+        if not scores:
+            return self.fallback.rerank(question, candidates)
+        ranked = []
+        for index, score in scores:
+            candidate = dict(candidates[index])
+            candidate["rerank_score"] = score
+            ranked.append(candidate)
+        return ranked
+
+    @staticmethod
+    def _parse_scores(data: Any, candidate_count: int) -> List[tuple[int, float]]:
+        raw_items = data
+        if isinstance(data, dict):
+            raw_items = data.get("results", data.get("data", []))
+        if not isinstance(raw_items, list):
+            return []
+        scores: List[tuple[int, float]] = []
+        for position, item in enumerate(raw_items):
+            if not isinstance(item, dict):
+                continue
+            index = int(item.get("index", position))
+            if index < 0 or index >= candidate_count:
+                continue
+            raw_score = item.get("relevance_score", item.get("score", 0))
+            scores.append((index, float(raw_score)))
+        scores.sort(key=lambda item: item[1], reverse=True)
+        return scores
+
+
+def create_candidate_reranker(settings: Settings) -> CandidateReranker:
+    fallback = DefaultCandidateReranker(
+        settings.retrieval_min_score,
+        settings.retrieval_max_chunks_per_document,
+    )
+    if settings.reranker_type == "identity":
+        return IdentityCandidateReranker()
+    if settings.reranker_type == "external":
+        return ExternalCandidateReranker(
+            endpoint=settings.reranker_endpoint,
+            model=settings.reranker_model,
+            api_key=settings.reranker_api_key,
+            timeout_seconds=settings.model_timeout_seconds,
+            fallback=fallback,
+        )
+    return fallback
+
+
+class DefaultQueryPreprocessor:
+    def __init__(
+        self,
+        enabled: bool = True,
+        rewrite_types: Optional[Sequence[str]] = None,
+        max_queries: int = 3,
+    ) -> None:
+        self.enabled = enabled
+        aliases = {"standalone": "direct"}
+        self.rewrite_types = [
+            aliases.get(item.strip().lower(), item.strip().lower())
+            for item in (rewrite_types or ["normalize"])
+        ]
+        self.max_queries = max(1, max_queries)
+
+    def preprocess(
+        self,
+        question: str,
+        model_gateway: RAGModelGateway,
+        max_queries: Optional[int] = None,
+    ) -> List[str]:
+        limit = max(1, max_queries or self.max_queries)
+        normalized_question = normalize_query(question)
+        if not normalized_question:
+            return []
+        queries = [normalized_question]
+        if not self.enabled:
+            return queries
+
+        for rewrite_type in self.rewrite_types:
+            if len(queries) >= limit:
+                break
+            if rewrite_type == "normalize":
+                continue
+            if rewrite_type == "direct":
+                try:
+                    self._append_query(
+                        queries,
+                        model_gateway.rewrite_query(normalized_question),
+                        limit,
+                    )
+                except Exception:
+                    continue
+            elif rewrite_type == "hyde":
+                try:
+                    self._append_query(
+                        queries,
+                        model_gateway.generate_hypothetical_document(
+                            normalized_question
+                        ),
+                        limit,
+                    )
+                except Exception:
+                    continue
+            elif rewrite_type == "step_back":
+                try:
+                    self._append_query(
+                        queries,
+                        model_gateway.rewrite_step_back_query(
+                            normalized_question
+                        ),
+                        limit,
+                    )
+                except Exception:
+                    continue
+            elif rewrite_type == "multi_query":
+                if len(queries) >= limit:
+                    continue
+                try:
+                    for query in model_gateway.rewrite_queries(
+                        normalized_question, count=limit
+                    ):
+                        self._append_query(queries, query, limit)
+                except Exception:
+                    continue
+        return queries
+
+    @staticmethod
+    def _append_query(queries: List[str], query: str, limit: int) -> None:
+        normalized = normalize_query(query)
+        if normalized and normalized not in queries and len(queries) < limit:
+            queries.append(normalized)
+
+
+def create_query_preprocessor(settings: Settings) -> QueryPreprocessor:
+    return DefaultQueryPreprocessor(
+        enabled=settings.query_rewrite_enabled,
+        rewrite_types=settings.query_rewrite_types,
+        max_queries=settings.query_rewrite_max_queries,
+    )
+
+
+def normalize_query(query: str) -> str:
+    return " ".join(str(query or "").strip().split())
 
 
 class LangChainRAGModelGateway:
@@ -250,6 +458,67 @@ class LangChainRAGModelGateway:
                 break
         return result
 
+    def rewrite_query(self, question: str) -> str:
+        prompt = PromptTemplate(
+            template=(
+                "你是企业知识库 RAG 系统的查询改写器。"
+                "请把用户问题改写为一个完整、独立、适合检索的查询。"
+                "只返回 JSON：{{\"query\":\"...\"}}。"
+                "不要访问外部网络，不要扩大授权范围。\n问题：{question}"
+            ),
+            input_variables=["question"],
+        )
+        response = (
+            prompt | create_chat_model(max_tokens=200) | StrOutputParser()
+        ).invoke({"question": question})
+        try:
+            match = re.search(r"\{.*\}", response, flags=re.DOTALL)
+            parsed = json.loads(match.group() if match else response)
+        except (json.JSONDecodeError, TypeError):
+            return ""
+        return str(parsed.get("query", "")).strip()
+
+    def generate_hypothetical_document(self, question: str) -> str:
+        prompt = PromptTemplate(
+            template=(
+                "你是企业知识库 RAG 系统的 HyDE 查询生成器。"
+                "请根据用户问题生成一段可能出现在专业知识库中的假设答案文档。"
+                "这段内容只用于向量检索，不是最终答案。"
+                "不要添加引用编号，不要声称内容已经得到真实资料验证。"
+                "只返回 JSON：{{\"document\":\"...\"}}。\n问题：{question}"
+            ),
+            input_variables=["question"],
+        )
+        response = (
+            prompt | create_chat_model(max_tokens=500) | StrOutputParser()
+        ).invoke({"question": question})
+        try:
+            match = re.search(r"\{.*\}", response, flags=re.DOTALL)
+            parsed = json.loads(match.group() if match else response)
+        except (json.JSONDecodeError, TypeError):
+            return ""
+        return str(parsed.get("document", "")).strip()
+
+    def rewrite_step_back_query(self, question: str) -> str:
+        prompt = PromptTemplate(
+            template=(
+                "你是企业知识库 RAG 系统的 Step-back 查询生成器。"
+                "请把具体问题提升为一个更上位、更通用、能够检索背景知识或核心原理的问题。"
+                "不要直接回答原问题。"
+                "只返回 JSON：{{\"query\":\"...\"}}。\n问题：{question}"
+            ),
+            input_variables=["question"],
+        )
+        response = (
+            prompt | create_chat_model(max_tokens=200) | StrOutputParser()
+        ).invoke({"question": question})
+        try:
+            match = re.search(r"\{.*\}", response, flags=re.DOTALL)
+            parsed = json.loads(match.group() if match else response)
+        except (json.JSONDecodeError, TypeError):
+            return ""
+        return str(parsed.get("query", "")).strip()
+
 
 class RAGService:
     def __init__(
@@ -257,13 +526,14 @@ class RAGService:
         vector_store: Optional[MilvusChunkStore] = None,
         model_gateway: Optional[RAGModelGateway] = None,
         reranker: Optional[CandidateReranker] = None,
+        query_preprocessor: Optional[QueryPreprocessor] = None,
     ) -> None:
         self.settings = get_settings()
         self.vector_store = vector_store or MilvusChunkStore()
         self.model_gateway = model_gateway or LangChainRAGModelGateway()
-        self.reranker = reranker or DefaultCandidateReranker(
-            self.settings.retrieval_min_score,
-            self.settings.retrieval_max_chunks_per_document,
+        self.reranker = reranker or create_candidate_reranker(self.settings)
+        self.query_preprocessor = query_preprocessor or create_query_preprocessor(
+            self.settings
         )
         self._grading_lock = threading.Lock()
         self._grading_failures = 0
@@ -272,11 +542,13 @@ class RAGService:
 
     def _build_graph(self):
         workflow = StateGraph(RAGState)
+        workflow.add_node("preprocess_query", self._preprocess_query)
         workflow.add_node("retrieve", self._retrieve)
         workflow.add_node("grade_documents", self._grade_documents)
         workflow.add_node("rewrite_and_retrieve", self._rewrite_and_retrieve)
         workflow.add_node("generate", self._generate)
-        workflow.set_entry_point("retrieve")
+        workflow.set_entry_point("preprocess_query")
+        workflow.add_edge("preprocess_query", "retrieve")
         workflow.add_edge("retrieve", "grade_documents")
         workflow.add_conditional_edges(
             "grade_documents",
@@ -290,16 +562,38 @@ class RAGService:
         workflow.add_edge("generate", END)
         return workflow.compile()
 
-    def _retrieve(self, state: RAGState) -> RAGState:
+    def _preprocess_query(self, state: RAGState) -> RAGState:
         started = time.perf_counter()
-        candidates = self.vector_store.search(
+        queries = self.query_preprocessor.preprocess(
             state["question"],
-            state.get("version_uuids", []),
-            self.settings.retrieval_candidate_count,
+            self.model_gateway,
+            self.settings.query_rewrite_max_queries,
         )
         return {
             **state,
-            "candidates": candidates,
+            "queries": queries,
+            "query_rewrite_attempted": True,
+            "timings": self._timing_with(
+                state.get("timings", {}),
+                "query_preprocess",
+                time.perf_counter() - started,
+            ),
+        }
+
+    def _retrieve(self, state: RAGState) -> RAGState:
+        started = time.perf_counter()
+        candidates: List[Dict[str, Any]] = []
+        for query in state.get("queries", []):
+            candidates.extend(
+                self.vector_store.search(
+                    query,
+                    state.get("version_uuids", []),
+                    self.settings.retrieval_candidate_count,
+                )
+            )
+        return {
+            **state,
+            "candidates": self._merge_candidates(candidates),
             "timings": {
                 **state.get("timings", {}),
                 "retrieval": time.perf_counter() - started,
@@ -308,7 +602,9 @@ class RAGService:
 
     def _grade_documents(self, state: RAGState) -> RAGState:
         started = time.perf_counter()
-        candidates = self.reranker.rerank(state.get("candidates", []))
+        candidates = self.reranker.rerank(
+            state["question"], state.get("candidates", [])
+        )
         if self._grading_circuit_is_open():
             return {
                 **state,
@@ -372,7 +668,18 @@ class RAGService:
 
     def _rewrite_and_retrieve(self, state: RAGState) -> RAGState:
         rewrite_started = time.perf_counter()
-        rewrites = self.model_gateway.rewrite_queries(state["question"], count=2)
+        rewritten_queries = self.query_preprocessor.preprocess(
+            state["question"],
+            self.model_gateway,
+            self.settings.query_rewrite_max_queries
+            + self.settings.query_rewrite_corrective_max_queries,
+        )
+        previous_queries = set(state.get("queries", []))
+        rewrites = [
+            query
+            for query in rewritten_queries
+            if query not in previous_queries
+        ][: self.settings.query_rewrite_corrective_max_queries]
         query_rewrite_timing = time.perf_counter() - rewrite_started
         if not rewrites:
             timings = state.get("timings", {})

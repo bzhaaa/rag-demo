@@ -2,8 +2,16 @@ from typing import Any, Dict, List, Sequence
 
 from sqlalchemy import select
 
+from app.config import Settings
 from app.models import Message
-from app.rag import DefaultCandidateReranker, RAGService
+from app.rag import (
+    DefaultCandidateReranker,
+    DefaultQueryPreprocessor,
+    ExternalCandidateReranker,
+    IdentityCandidateReranker,
+    RAGService,
+    create_candidate_reranker,
+)
 
 
 class FakeVectorStore:
@@ -24,12 +32,23 @@ class FakeModelGateway:
         answers: Sequence[str],
         relevance: Sequence[object] = (),
         rewrites: Sequence[str] = (),
+        rewrite_batches: Sequence[Sequence[str]] = (),
+        direct_rewrite: str = "",
+        hyde_document: str = "",
+        step_back_query: str = "",
     ) -> None:
         self.answers = list(answers)
         self.relevance = list(relevance)
         self.rewrites = list(rewrites)
+        self.rewrite_batches = [list(batch) for batch in rewrite_batches]
+        self.direct_rewrite = direct_rewrite
+        self.hyde_document = hyde_document
+        self.step_back_query = step_back_query
         self.generate_calls: List[bool] = []
         self.rewrite_calls = 0
+        self.standalone_calls = 0
+        self.hyde_calls = 0
+        self.step_back_calls = 0
 
     def grade_relevance(
         self,
@@ -54,7 +73,23 @@ class FakeModelGateway:
 
     def rewrite_queries(self, question: str, count: int = 2) -> List[str]:
         self.rewrite_calls += 1
+        if self.rewrite_batches:
+            return self.rewrite_batches.pop(0)[:count]
         return list(self.rewrites[:count])
+
+    def rewrite_query(self, question: str) -> str:
+        self.standalone_calls += 1
+        if self.direct_rewrite:
+            return self.direct_rewrite
+        return self.rewrites[0] if self.rewrites else ""
+
+    def generate_hypothetical_document(self, question: str) -> str:
+        self.hyde_calls += 1
+        return self.hyde_document
+
+    def rewrite_step_back_query(self, question: str) -> str:
+        self.step_back_calls += 1
+        return self.step_back_query
 
 
 def create_rag_user_and_document(db, models):
@@ -181,13 +216,215 @@ def test_default_reranker_filters_deduplicates_sorts_and_limits_documents():
         },
     ]
 
-    result = reranker.rerank(candidates)
+    result = reranker.rerank("问题", candidates)
 
     assert [item["chunk_id"] for item in result] == [
         "a-duplicate-high",
         "b-one",
         "a-third",
     ]
+
+
+def test_reranker_factory_uses_configured_strategy():
+    assert isinstance(
+        create_candidate_reranker(Settings(reranker_type="default")),
+        DefaultCandidateReranker,
+    )
+    assert isinstance(
+        create_candidate_reranker(Settings(reranker_type="identity")),
+        IdentityCandidateReranker,
+    )
+    assert isinstance(
+        create_candidate_reranker(
+            Settings(
+                reranker_type="external",
+                reranker_endpoint="https://rerank.example/v1/rerank",
+                reranker_model="rerank-v1",
+            )
+        ),
+        ExternalCandidateReranker,
+    )
+
+
+def test_external_reranker_sends_query_and_orders_by_model_scores():
+    requests = []
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> Dict[str, Any]:
+            return {
+                "results": [
+                    {"index": 1, "relevance_score": 0.98},
+                    {"index": 0, "relevance_score": 0.31},
+                ]
+            }
+
+    def fake_post(url, json, headers, timeout):
+        requests.append(
+            {
+                "url": url,
+                "json": json,
+                "headers": headers,
+                "timeout": timeout,
+            }
+        )
+        return FakeResponse()
+
+    candidates = [
+        {"chunk_id": "first", "document_uuid": "a", "content": "第一段", "score": 0.9},
+        {"chunk_id": "second", "document_uuid": "b", "content": "第二段", "score": 0.1},
+    ]
+    reranker = ExternalCandidateReranker(
+        endpoint="https://rerank.example/v1/rerank",
+        model="rerank-v1",
+        api_key="secret",
+        post=fake_post,
+    )
+
+    result = reranker.rerank("用户问题", candidates)
+
+    assert requests[0]["url"] == "https://rerank.example/v1/rerank"
+    assert requests[0]["headers"]["Authorization"] == "Bearer secret"
+    assert requests[0]["json"]["query"] == "用户问题"
+    assert requests[0]["json"]["documents"] == ["第一段", "第二段"]
+    assert [item["chunk_id"] for item in result] == ["second", "first"]
+    assert result[0]["rerank_score"] == 0.98
+
+
+def test_query_preprocessor_normalizes_and_deduplicates_queries():
+    gateway = FakeModelGateway(
+        answers=[],
+        rewrites=[" 独立 查询 ", "扩展 查询", "独立 查询"],
+    )
+    preprocessor = DefaultQueryPreprocessor(
+        enabled=True,
+        rewrite_types=["normalize", "standalone", "multi_query"],
+        max_queries=3,
+    )
+
+    result = preprocessor.preprocess("  原始   问题  ", gateway)
+
+    assert result == ["原始 问题", "独立 查询", "扩展 查询"]
+    assert gateway.standalone_calls == 1
+    assert gateway.rewrite_calls == 1
+
+
+def test_query_preprocessor_supports_direct_hyde_step_back_and_multi_query():
+    gateway = FakeModelGateway(
+        answers=[],
+        rewrite_batches=[["扩展查询一", "扩展查询二"]],
+        direct_rewrite="直接改写查询",
+        hyde_document="一段符合知识库文体的假设答案",
+        step_back_query="这个问题依赖哪些通用原理",
+    )
+    preprocessor = DefaultQueryPreprocessor(
+        enabled=True,
+        rewrite_types=[
+            "normalize",
+            "direct",
+            "hyde",
+            "step_back",
+            "multi_query",
+        ],
+        max_queries=7,
+    )
+
+    result = preprocessor.preprocess(" 原始问题 ", gateway)
+
+    assert result == [
+        "原始问题",
+        "直接改写查询",
+        "一段符合知识库文体的假设答案",
+        "这个问题依赖哪些通用原理",
+        "扩展查询一",
+        "扩展查询二",
+    ]
+    assert gateway.standalone_calls == 1
+    assert gateway.hyde_calls == 1
+    assert gateway.step_back_calls == 1
+    assert gateway.rewrite_calls == 1
+
+
+def test_query_preprocessor_respects_configured_types():
+    gateway = FakeModelGateway(answers=[], rewrites=["独立查询", "扩展查询"])
+
+    assert DefaultQueryPreprocessor(
+        enabled=True,
+        rewrite_types=["normalize"],
+        max_queries=3,
+    ).preprocess("  原始   问题  ", gateway) == ["原始 问题"]
+
+    assert DefaultQueryPreprocessor(
+        enabled=True,
+        rewrite_types=["normalize", "standalone"],
+        max_queries=3,
+    ).preprocess("  原始   问题  ", gateway) == ["原始 问题", "独立查询"]
+
+    gateway = FakeModelGateway(answers=[], rewrites=["独立查询", "扩展查询"])
+    assert DefaultQueryPreprocessor(
+        enabled=True,
+        rewrite_types=["normalize", "multi_query"],
+        max_queries=3,
+    ).preprocess("  原始   问题  ", gateway) == ["原始 问题", "独立查询", "扩展查询"]
+
+
+def test_query_rewrite_types_parse_from_comma_separated_config():
+    settings = Settings(
+        query_rewrite_types="normalize, standalone, multi_query"
+    )
+
+    assert settings.query_rewrite_types == [
+        "normalize",
+        "direct",
+        "multi_query",
+    ]
+
+
+def test_query_rewrite_types_accept_all_supported_strategies():
+    settings = Settings(
+        query_rewrite_types=(
+            "normalize,direct,hyde,step_back,multi_query"
+        )
+    )
+
+    assert settings.query_rewrite_types == [
+        "normalize",
+        "direct",
+        "hyde",
+        "step_back",
+        "multi_query",
+    ]
+
+
+def test_query_preprocessor_disabled_returns_normalized_original_only():
+    gateway = FakeModelGateway(answers=[], rewrites=["不应使用"])
+    preprocessor = DefaultQueryPreprocessor(
+        enabled=False,
+        rewrite_types=["normalize", "standalone", "multi_query"],
+        max_queries=3,
+    )
+
+    result = preprocessor.preprocess("  原始   问题  ", gateway)
+
+    assert result == ["原始 问题"]
+    assert gateway.standalone_calls == 0
+    assert gateway.rewrite_calls == 0
+
+
+def test_empty_normalized_query_does_not_reach_vector_store(db_session):
+    db, models = db_session
+    user, _, _ = create_rag_user_and_document(db, models)
+    vector_store = FakeVectorStore({})
+    gateway = FakeModelGateway(answers=[], rewrites=["不应使用"])
+    service = RAGService(vector_store=vector_store, model_gateway=gateway)
+
+    result = service.answer(db, user, "   ")
+
+    assert result["refused"] is True
+    assert result["refusal_reason"] == "insufficient_authorized_evidence"
+    assert vector_store.calls == []
 
 
 def test_invalid_citations_retry_once_then_keep_only_referenced_chunks(db_session):
@@ -241,6 +478,7 @@ def test_corrective_rag_rewrites_once_when_initial_evidence_is_insufficient(
     vector_store = FakeVectorStore(
         {
             "原始问题": [first],
+            "初检无关": [first],
             "改写一": [rewritten],
             "改写二": [rewritten],
         }
@@ -248,16 +486,26 @@ def test_corrective_rag_rewrites_once_when_initial_evidence_is_insufficient(
     gateway = FakeModelGateway(
         ["改写查询找到了答案。[1]"],
         relevance=[False, True],
-        rewrites=["改写一", "改写二"],
+        rewrite_batches=[["初检无关"], ["改写一", "改写二"]],
     )
-    service = RAGService(vector_store=vector_store, model_gateway=gateway)
+    preprocessor = DefaultQueryPreprocessor(
+        enabled=True,
+        rewrite_types=["normalize", "multi_query"],
+        max_queries=2,
+    )
+    service = RAGService(
+        vector_store=vector_store,
+        model_gateway=gateway,
+        query_preprocessor=preprocessor,
+    )
 
     result = service.answer(db, user, "原始问题")
 
     assert result["refused"] is False
-    assert gateway.rewrite_calls == 1
+    assert gateway.rewrite_calls == 2
     assert [call[0] for call in vector_store.calls] == [
         "原始问题",
+        "初检无关",
         "改写一",
         "改写二",
     ]
@@ -267,6 +515,50 @@ def test_corrective_rag_rewrites_once_when_initial_evidence_is_insufficient(
     ]
     assert "query_rewrite" in result["timings"]
     assert "corrective_retrieval" in result["timings"]
+
+
+def test_initial_retrieval_uses_preprocessed_queries_with_same_authorization(
+    db_session,
+):
+    db, models = db_session
+    user, document, version = create_rag_user_and_document(db, models)
+    original = make_chunk(document, version, 0, "原始查询证据。", score=0.5)
+    expanded = make_chunk(document, version, 1, "扩展查询证据。", score=0.95)
+    vector_store = FakeVectorStore(
+        {
+            "原始问题": [original],
+            "扩展问题": [expanded],
+            "同义问题": [expanded],
+        }
+    )
+    gateway = FakeModelGateway(
+        answers=["扩展查询可以回答。[1]"],
+        relevance=[True],
+        rewrites=["扩展问题", "同义问题"],
+    )
+    preprocessor = DefaultQueryPreprocessor(
+        enabled=True,
+        rewrite_types=["normalize", "multi_query"],
+        max_queries=3,
+    )
+    service = RAGService(
+        vector_store=vector_store,
+        model_gateway=gateway,
+        query_preprocessor=preprocessor,
+    )
+
+    result = service.answer(db, user, " 原始问题 ")
+
+    assert [call[0] for call in vector_store.calls] == [
+        "原始问题",
+        "扩展问题",
+        "同义问题",
+    ]
+    assert all(call[1] == [version.uuid] for call in vector_store.calls)
+    assert [item["chunk_id"] for item in result["citations"]] == [
+        expanded["chunk_id"]
+    ]
+    assert "query_preprocess" in result["timings"]
 
 
 def test_corrective_rag_does_not_rewrite_when_initial_evidence_is_sufficient(
@@ -286,8 +578,8 @@ def test_corrective_rag_does_not_rewrite_when_initial_evidence_is_sufficient(
     result = service.answer(db, user, "原始问题")
 
     assert result["refused"] is False
-    assert gateway.rewrite_calls == 0
-    assert [call[0] for call in vector_store.calls] == ["原始问题"]
+    assert gateway.rewrite_calls == 1
+    assert [call[0] for call in vector_store.calls] == ["原始问题", "不应使用"]
 
 
 def test_grading_failures_open_circuit_and_refuse_conservatively(db_session):
@@ -327,5 +619,5 @@ def test_failed_query_rewrite_keeps_insufficient_evidence_refusal(db_session):
 
     assert result["refused"] is True
     assert result["refusal_reason"] == "insufficient_authorized_evidence"
-    assert gateway.rewrite_calls == 1
+    assert gateway.rewrite_calls == 2
     assert [call[0] for call in vector_store.calls] == ["问题"]
