@@ -21,7 +21,13 @@ RAG 子系统包括：
 - `app/ingestion.py`：抽取文本并构建 chunk 元数据。
 - `app/vector_store.py`：负责 Milvus collection schema、Embedding 调用、带过滤条件的检索、向量写入/删除和元数据同步。
 - `app/repositories.py`：解析当前用户可访问的活跃文档版本。
-- `app/rag.py`：LangGraph 工作流，包含授权检索、候选重排、相关性评分、查询改写、答案生成和引用校验。
+- `app/rag/service.py`：RAGService 和 LangGraph 编排，负责授权检索、纠错分支、生成、引用和持久化。
+- `app/rag/model_gateway.py`：LLM 调用入口，负责相关性评分、答案生成、Direct、HyDE、Step-back 和 Multi-query。
+- `app/rag/preprocessors.py`：Query 预处理协议实现和策略组合。
+- `app/rag/rerankers.py`：本地、透传和外部 HTTP reranker 实现。
+- `app/rag/types.py`：RAG 状态和组件 Protocol。
+- `app/rag/utils.py`：查询规范化、候选合并、引用解析等无状态工具。
+- `app/rag/__init__.py`：兼容导出层，保留 `from app.rag import RAGService` 等旧导入方式。
 - `app/models.py`：存储文档、版本、入库任务、会话、消息、引用、指标和审计日志。
 - `app/config.py`：RAG、模型和索引相关配置。
 - `tests/test_domain.py`：当前覆盖 chunk ID、相关性解析、上传校验和结构化拒答的单元测试。
