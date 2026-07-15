@@ -2,11 +2,54 @@ import json
 import re
 from typing import Any, Dict, List, Sequence
 
+TRUTHY_RELEVANCE = {"yes", "y", "true", "1", "relevant", "是", "相关"}
+FALSY_RELEVANCE = {"no", "n", "false", "0", "irrelevant", "否", "不相关"}
 
-def parse_relevance(response: str) -> bool:
-    match = re.search(r"\{.*\}", response, flags=re.DOTALL)
-    parsed = json.loads(match.group() if match else response)
-    return str(parsed.get("score", "")).lower() == "yes"
+
+def parse_first_json_object(response: str) -> Dict[str, Any]:
+    decoder = json.JSONDecoder()
+    text = str(response or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            parsed, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    raise json.JSONDecodeError("No JSON object found", text, 0)
+
+
+def parse_relevance(response: Any) -> bool:
+    if isinstance(response, bool):
+        return response
+    if isinstance(response, dict):
+        parsed = response
+    else:
+        text = str(response or "").strip()
+        normalized = text.lower()
+        if normalized in TRUTHY_RELEVANCE:
+            return True
+        if normalized in FALSY_RELEVANCE:
+            return False
+        parsed = parse_first_json_object(text)
+
+    for field in ("score", "relevant", "is_relevant", "answer"):
+        if field not in parsed:
+            continue
+        value = parsed[field]
+        if isinstance(value, bool):
+            return value
+        normalized_value = str(value).strip().lower()
+        if normalized_value in TRUTHY_RELEVANCE:
+            return True
+        if normalized_value in FALSY_RELEVANCE:
+            return False
+    return False
 
 
 def normalize_query(query: str) -> str:

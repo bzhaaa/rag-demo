@@ -12,13 +12,14 @@ from app.config import Settings, get_settings
 from app.models import Conversation, Document, Message, MessageRole, User
 from app.rag.model_gateway import LangChainRAGModelGateway
 from app.rag.preprocessors import create_query_preprocessor
-from app.rag.rerankers import create_candidate_reranker
+from app.rag.rerankers import RerankerError, create_candidate_reranker
 from app.rag.types import (
     CandidateReranker,
     QueryPreprocessor,
     RAGModelGateway,
     RAGState,
     WebSearchProvider,
+    WebSearchResponse,
 )
 from app.rag.utils import merge_candidates, timing_with, valid_citation_indices
 from app.rag.web_search import create_web_search_provider, merge_web_results
@@ -98,6 +99,11 @@ class RAGService:
             **state,
             "queries": queries,
             "query_rewrite_attempted": True,
+            "diagnostics": {
+                **state.get("diagnostics", {}),
+                "queries": queries,
+                "query_rewrite_attempted": True,
+            },
             "timings": timing_with(
                 state.get("timings", {}),
                 "query_preprocess",
@@ -119,6 +125,15 @@ class RAGService:
         return {
             **state,
             "candidates": merge_candidates(candidates),
+            "diagnostics": {
+                **state.get("diagnostics", {}),
+                "retrieval": {
+                    "candidate_count": len(merge_candidates(candidates)),
+                    "candidates": self._candidate_summaries(
+                        merge_candidates(candidates)
+                    ),
+                },
+            },
             "timings": timing_with(
                 state.get("timings", {}),
                 "retrieval",
@@ -128,13 +143,21 @@ class RAGService:
 
     def _grade_documents(self, state: RAGState) -> RAGState:
         started = time.perf_counter()
-        candidates, relevant = self._grade_candidates(
-            state["question"], state.get("candidates", [])
+        candidates, relevant, grading = self._grade_candidates(
+            state["question"], state.get("candidates", []), "knowledge"
         )
+        diagnostics = state.get("diagnostics", {})
         return {
             **state,
             "candidates": candidates,
             "relevant": relevant[: self.settings.final_context_count],
+            "diagnostics": {
+                **diagnostics,
+                "reranking": {
+                    **diagnostics.get("reranking", {}),
+                    "knowledge": grading,
+                },
+            },
             "timings": timing_with(
                 state.get("timings", {}),
                 "grading",
@@ -164,6 +187,11 @@ class RAGService:
             **state,
             "evidence_route": route,
             "evidence_routing_failed": failed,
+            "diagnostics": {
+                **state.get("diagnostics", {}),
+                "evidence_route": route,
+                "evidence_routing_failed": failed,
+            },
             "timings": timing_with(
                 state.get("timings", {}),
                 "evidence_routing",
@@ -180,20 +208,65 @@ class RAGService:
     def _web_search(self, state: RAGState) -> RAGState:
         started = time.perf_counter()
         results: List[Dict[str, Any]] = []
+        query_count = 0
+        failed = False
+        retry_count = 0
+        error_type = None
+        request_ids = []
+        provider_response_time = 0.0
+        usage_credits = 0.0
         for query in state.get("queries", [])[: self.settings.web_search_max_queries]:
+            query_count += 1
             try:
-                results.extend(
-                    self.web_search_provider.search(
-                        query,
-                        self.settings.web_search_result_count,
-                    )
+                response = self.web_search_provider.search(
+                    query,
+                    self.settings.web_search_result_count,
                 )
-            except Exception:
-                continue
+            except Exception as exc:
+                failed = True
+                error_type = getattr(exc, "error_type", type(exc).__name__)
+                retry_count += int(getattr(exc, "retry_count", 0))
+                break
+            if isinstance(response, WebSearchResponse):
+                results.extend(response.results)
+                diagnostics = response.diagnostics
+                retry_count += int(diagnostics.get("retry_count") or 0)
+                if diagnostics.get("request_id"):
+                    request_ids.append(diagnostics["request_id"])
+                provider_response_time += float(
+                    diagnostics.get("provider_response_time") or 0
+                )
+                usage_credits += float(
+                    diagnostics.get("usage_credits") or 0
+                )
+            else:
+                results.extend(response)
+        merged_results = [] if failed else merge_web_results(results)
         return {
             **state,
-            "web_candidates": merge_web_results(results),
+            "web_candidates": merged_results,
             "web_search_attempted": True,
+            "web_search_failed": failed,
+            "diagnostics": {
+                **state.get("diagnostics", {}),
+                "web_search": {
+                    "attempted": True,
+                    "query_count": query_count,
+                    "candidate_count": len(merged_results),
+                    "result_count": len(merged_results),
+                    "provider": self.web_search_provider.name,
+                    "failed": failed,
+                    "retry_count": retry_count,
+                    "error_type": error_type,
+                    "request_id": (
+                        request_ids[0]
+                        if len(request_ids) == 1
+                        else request_ids or None
+                    ),
+                    "provider_response_time": provider_response_time or None,
+                    "usage_credits": usage_credits or None,
+                },
+            },
             "timings": timing_with(
                 state.get("timings", {}),
                 "web_search",
@@ -203,13 +276,21 @@ class RAGService:
 
     def _grade_web_documents(self, state: RAGState) -> RAGState:
         started = time.perf_counter()
-        candidates, relevant = self._grade_candidates(
-            state["question"], state.get("web_candidates", [])
+        candidates, relevant, grading = self._grade_candidates(
+            state["question"], state.get("web_candidates", []), "web"
         )
+        diagnostics = state.get("diagnostics", {})
         return {
             **state,
             "web_candidates": candidates,
             "web_relevant": relevant[: self.settings.final_context_count],
+            "diagnostics": {
+                **diagnostics,
+                "reranking": {
+                    **diagnostics.get("reranking", {}),
+                    "web": grading,
+                },
+            },
             "timings": timing_with(
                 state.get("timings", {}),
                 "web_grading",
@@ -221,32 +302,189 @@ class RAGService:
         self,
         question: str,
         candidates: Sequence[Dict[str, Any]],
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        reranked = self.reranker.rerank(question, candidates)
-        if self._grading_circuit_is_open() or not reranked:
-            return reranked, []
-        if self.settings.relevance_grading_enabled:
+        stage: str,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+        if not candidates:
+            return [], [], {
+                "stage": stage,
+                "input_count": 0,
+                "passed_count": 0,
+                "relevant_count": 0,
+                "failure_count": 0,
+                "skipped": "no_candidates",
+                "min_score": self.settings.reranker_min_score,
+                "top_k": self.settings.reranker_top_k,
+                "results": [],
+            }
+
+        try:
+            reranked = self.reranker.rerank(question, candidates)
+        except Exception as exc:
+            return self._handle_reranker_failure(question, candidates, stage, exc)
+
+        return self._admit_reranked_candidates(candidates, reranked, stage)
+
+    def _admit_reranked_candidates(
+        self,
+        candidates: Sequence[Dict[str, Any]],
+        reranked: Sequence[Dict[str, Any]],
+        stage: str,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+        original_candidates = list(candidates)
+        ranked = list(reranked)
+        relevant = [
+            candidate
+            for candidate in ranked
+            if float(candidate.get("rerank_score") or 0)
+            >= self.settings.reranker_min_score
+        ][: self.settings.reranker_top_k]
+        ranked_by_chunk_id = {
+            candidate.get("chunk_id"): candidate
+            for candidate in ranked
+            if candidate.get("chunk_id")
+        }
+        passed_chunk_ids = {candidate.get("chunk_id") for candidate in relevant}
+        results = []
+        for candidate in original_candidates:
+            ranked_candidate = ranked_by_chunk_id.get(candidate.get("chunk_id"))
+            diagnostic_candidate = ranked_candidate or candidate
+            passed = candidate.get("chunk_id") in passed_chunk_ids
+            results.append(
+                {
+                    **self._candidate_summary(diagnostic_candidate),
+                    "relevant": bool(passed),
+                    "passed": bool(passed),
+                }
+            )
+        self._reset_grading_failures()
+        return original_candidates, relevant, {
+            "stage": stage,
+            "input_count": len(original_candidates),
+            "passed_count": len(relevant),
+            "relevant_count": len(relevant),
+            "failure_count": 0,
+            "failed": False,
+            "min_score": self.settings.reranker_min_score,
+            "top_k": self.settings.reranker_top_k,
+            "failure_strategy": None,
+            "endpoint": self.settings.reranker_endpoint,
+            "model": self.settings.reranker_model,
+            "results": results,
+        }
+
+    def _handle_reranker_failure(
+        self,
+        question: str,
+        candidates: Sequence[Dict[str, Any]],
+        stage: str,
+        exc: Exception,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+        strategy = self.settings.reranker_failure_strategy
+        base = {
+            "stage": stage,
+            "input_count": len(candidates),
+            "passed_count": 0,
+            "relevant_count": 0,
+            "failure_count": len(candidates),
+            "failed": True,
+            "failure_strategy": strategy,
+            "error_type": type(exc).__name__,
+            "error": self._truncate(str(exc), 300),
+            "min_score": self.settings.reranker_min_score,
+            "top_k": self.settings.reranker_top_k,
+            "endpoint": self.settings.reranker_endpoint,
+            "model": self.settings.reranker_model,
+            "results": [],
+        }
+
+        if strategy == "reject":
+            return list(candidates), [], base
+        if strategy == "vector":
+            fallback = [
+                candidate
+                for candidate in sorted(
+                    candidates,
+                    key=lambda item: float(item.get("score") or 0),
+                    reverse=True,
+                )
+                if float(candidate.get("score") or 0)
+                >= float(self.settings.retrieval_min_score or 0)
+            ][: self.settings.reranker_top_k]
+            results = [
+                {
+                    **self._candidate_summary(candidate),
+                    "relevant": candidate in fallback,
+                    "passed": candidate in fallback,
+                }
+                for candidate in candidates
+            ]
+            return list(candidates), fallback, {
+                **base,
+                "passed_count": len(fallback),
+                "relevant_count": len(fallback),
+                "failure_count": 1,
+                "fallback": "vector",
+                "results": results,
+            }
+        if strategy == "llm":
+            reranked = list(candidates)
+            if self._grading_circuit_is_open():
+                return reranked, [], {
+                    **base,
+                    "skipped": "circuit_open",
+                    "fallback": "llm",
+                }
             responses = self.model_gateway.grade_relevance(
                 question,
                 reranked,
                 self.settings.relevance_max_concurrency,
             )
-        else:
-            responses = [True] * len(reranked)
-
-        relevant: List[Dict[str, Any]] = []
-        failure_count = 0
-        for candidate, response in zip(reranked, responses):
-            if isinstance(response, Exception):
-                failure_count += 1
-                continue
-            if response:
-                relevant.append(candidate)
-        if reranked and failure_count == len(reranked):
-            self._record_grading_failure()
-        else:
-            self._reset_grading_failures()
-        return reranked, relevant
+            relevant: List[Dict[str, Any]] = []
+            failure_count = 0
+            grade_results: List[Dict[str, Any]] = []
+            for candidate, response in zip(reranked, responses):
+                if isinstance(response, Exception):
+                    failure_count += 1
+                    grade_results.append(
+                        {
+                            **self._candidate_summary(candidate),
+                            "relevant": False,
+                            "error_type": type(response).__name__,
+                            "error": self._truncate(str(response), 300),
+                        }
+                    )
+                    continue
+                is_relevant = (
+                    response
+                    if isinstance(response, bool)
+                    else bool(getattr(response, "relevant", False))
+                )
+                grade_results.append(
+                    {
+                        **self._candidate_summary(candidate),
+                        "relevant": bool(is_relevant),
+                        "raw_response": self._truncate(
+                            str(getattr(response, "raw_response", "")),
+                            300,
+                        ),
+                        "parsed_score": getattr(response, "parsed_score", None),
+                    }
+                )
+                if is_relevant:
+                    relevant.append(candidate)
+            if reranked and failure_count == len(reranked):
+                self._record_grading_failure()
+            else:
+                self._reset_grading_failures()
+            return reranked, relevant[: self.settings.reranker_top_k], {
+                **base,
+                "passed_count": len(relevant[: self.settings.reranker_top_k]),
+                "relevant_count": len(relevant[: self.settings.reranker_top_k]),
+                "failure_count": failure_count,
+                "fallback": "llm",
+                "results": grade_results,
+            }
+        raise RerankerError(f"unsupported reranker failure strategy: {strategy}")
 
     def _select_evidence(self, state: RAGState) -> RAGState:
         knowledge = state.get("relevant", [])
@@ -272,6 +510,10 @@ class RAGService:
             **state,
             "evidence_route": route,
             "evidence": evidence,
+            "diagnostics": {
+                **state.get("diagnostics", {}),
+                "selected_evidence_count": len(evidence),
+            },
         }
 
     def _generate(self, state: RAGState) -> RAGState:
@@ -279,6 +521,7 @@ class RAGService:
         evidence = state.get("evidence", state.get("relevant", []))
         if len(evidence) < self.settings.rag_min_relevant_documents:
             web_enabled = getattr(self.settings, "web_search_enabled", False)
+            refusal_detail = self._refusal_detail(state)
             return {
                 **state,
                 "answer": (
@@ -293,6 +536,11 @@ class RAGService:
                     if web_enabled
                     else "insufficient_authorized_evidence"
                 ),
+                "refusal_detail": refusal_detail,
+                "diagnostics": {
+                    **state.get("diagnostics", {}),
+                    "refusal_detail": refusal_detail,
+                },
                 "timings": timing_with(
                     state.get("timings", {}),
                     "generation",
@@ -324,6 +572,11 @@ class RAGService:
                 "cited_indices": [],
                 "refused": True,
                 "refusal_reason": "invalid_citations",
+                "refusal_detail": "invalid_citations",
+                "diagnostics": {
+                    **state.get("diagnostics", {}),
+                    "refusal_detail": "invalid_citations",
+                },
                 "timings": {
                     **state.get("timings", {}),
                     "generation": generation_timing,
@@ -336,6 +589,11 @@ class RAGService:
             "cited_indices": cited_indices,
             "refused": False,
             "refusal_reason": None,
+            "refusal_detail": None,
+            "diagnostics": {
+                **state.get("diagnostics", {}),
+                "refusal_detail": None,
+            },
             "timings": {
                 **state.get("timings", {}),
                 "generation": generation_timing,
@@ -360,6 +618,9 @@ class RAGService:
                 "question": question,
                 "version_uuids": version_uuids,
                 "timings": {},
+                "diagnostics": {
+                    "authorized_version_count": len(version_uuids),
+                },
             },
             config={
                 "run_name": "enterprise-crag",
@@ -394,7 +655,10 @@ class RAGService:
                 citations=citations,
                 model_name=self.settings.llm_model,
                 trace_id=trace_id,
-                metrics=result.get("timings", {}),
+                metrics={
+                    "timings": result.get("timings", {}),
+                    "rag_diagnostics": result.get("diagnostics", {}),
+                },
             )
         )
         write_audit(
@@ -406,6 +670,7 @@ class RAGService:
             {
                 "trace_id": trace_id,
                 "refused": result.get("refused", False),
+                "refusal_detail": result.get("refusal_detail"),
                 "citation_count": len(citations),
                 "evidence_route": result.get("evidence_route"),
                 "web_search_attempted": result.get(
@@ -414,6 +679,7 @@ class RAGService:
                 "knowledge_evidence_count": len(result.get("relevant", [])),
                 "web_evidence_count": len(result.get("web_relevant", [])),
                 "web_search_provider": self.web_search_provider.name,
+                "web_search_failed": result.get("web_search_failed", False),
             },
         )
         conversation.updated_at = __import__("datetime").datetime.now(
@@ -426,9 +692,76 @@ class RAGService:
             "citations": citations,
             "refused": result.get("refused", False),
             "refusal_reason": result.get("refusal_reason"),
+            "refusal_detail": result.get("refusal_detail"),
             "trace_id": trace_id,
             "timings": result["timings"],
         }
+
+    def _refusal_detail(self, state: RAGState) -> str:
+        diagnostics = state.get("diagnostics", {})
+        reranking = diagnostics.get("reranking", {})
+        knowledge_reranking = reranking.get("knowledge", {})
+        grading = diagnostics.get("grading", {})
+        knowledge_grading = grading.get("knowledge", {})
+
+        if state.get("evidence_routing_failed"):
+            return "evidence_routing_failed"
+        if state.get("web_search_failed"):
+            return "web_search_failed"
+        if knowledge_reranking.get("failed") and (
+            knowledge_reranking.get("failure_strategy") == "reject"
+        ):
+            return "reranker_failed"
+        if "version_uuids" in state and not state.get("version_uuids"):
+            return "no_authorized_documents"
+        if "queries" in state and not state.get("queries"):
+            return "no_retrieval_queries"
+        if "candidates" in state and not state.get("candidates"):
+            return "no_retrieval_results"
+        if knowledge_grading.get("skipped") == "circuit_open":
+            return "relevance_grading_circuit_open"
+        if (
+            knowledge_grading.get("input_count")
+            and knowledge_grading.get("failure_count")
+            == knowledge_grading.get("input_count")
+        ):
+            return "relevance_grading_failed"
+        if state.get("candidates") and not state.get("relevant"):
+            return "no_relevant_evidence"
+        if state.get("evidence_route") == "web":
+            if not state.get("web_candidates"):
+                return "no_web_results"
+            if not state.get("web_relevant"):
+                return "no_relevant_web_evidence"
+        if state.get("evidence_route") == "hybrid":
+            return "insufficient_hybrid_evidence"
+        if getattr(self.settings, "web_search_enabled", False):
+            return "insufficient_evidence"
+        return "no_relevant_evidence"
+
+    @classmethod
+    def _candidate_summaries(
+        cls,
+        candidates: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        return [cls._candidate_summary(candidate) for candidate in candidates]
+
+    @staticmethod
+    def _candidate_summary(candidate: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "chunk_id": candidate.get("chunk_id"),
+            "document_uuid": candidate.get("document_uuid"),
+            "version_uuid": candidate.get("version_uuid"),
+            "source_type": candidate.get("source_type", "knowledge_base"),
+            "score": candidate.get("score"),
+            "rerank_score": candidate.get("rerank_score"),
+        }
+
+    @staticmethod
+    def _truncate(value: str, limit: int) -> str:
+        if len(value) <= limit:
+            return value
+        return value[: limit - 3] + "..."
 
     @staticmethod
     def _conversation(

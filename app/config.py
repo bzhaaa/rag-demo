@@ -2,7 +2,7 @@ import os
 from functools import lru_cache
 from typing import Annotated, List, Optional
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_base_url: str = ""
     llm_model: str = ""
+    llm_enable_thinking: bool = False
     embedding_api_key: str = ""
     embedding_base_url: str = ""
     embedding_model: str = ""
@@ -51,20 +52,27 @@ class Settings(BaseSettings):
     query_rewrite_enabled: bool = True
     query_rewrite_types: Annotated[List[str], NoDecode] = Field(
         default_factory=lambda: [
-            "normalize",
-            "direct",
             "multi_query",
         ]
     )
     query_rewrite_max_queries: int = 3
-    web_search_enabled: bool = False
-    web_search_provider: str = "mock"
-    web_search_max_queries: int = 3
+    web_search_enabled: bool = True
+    web_search_provider: str = "tavily"
+    web_search_max_queries: int = 1
     web_search_result_count: int = 5
-    reranker_type: str = "default"
+    web_search_timeout_seconds: int = 10
+    web_search_max_retries: int = 2
+    tavily_api_key: str = ""
+    tavily_endpoint: str = "https://api.tavily.com/search"
+    tavily_search_depth: str = "basic"
+    tavily_topic: str = "general"
+    reranker_type: str = "external"
     reranker_endpoint: str = ""
     reranker_api_key: str = ""
     reranker_model: str = ""
+    reranker_min_score: float = 0.5
+    reranker_top_k: int = 6
+    reranker_failure_strategy: str = "reject"
     retrieval_candidate_count: int = 10
     retrieval_min_score: Optional[float] = None
     retrieval_max_chunks_per_document: int = 3
@@ -112,6 +120,18 @@ class Settings(BaseSettings):
             return None
         return value
 
+    @field_validator("reranker_min_score")
+    @classmethod
+    def valid_reranker_min_score(cls, value: float) -> float:
+        if value < 0 or value > 1:
+            raise ValueError("reranker_min_score must be between 0 and 1")
+        return value
+
+    @field_validator("reranker_top_k")
+    @classmethod
+    def positive_reranker_top_k(cls, value: int) -> int:
+        return max(1, value)
+
     @field_validator("reranker_type")
     @classmethod
     def supported_reranker_type(cls, value: str) -> str:
@@ -120,22 +140,65 @@ class Settings(BaseSettings):
             raise ValueError("reranker_type must be default, identity, or external")
         return normalized
 
+    @field_validator("reranker_failure_strategy")
+    @classmethod
+    def supported_reranker_failure_strategy(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"reject", "vector", "llm"}:
+            raise ValueError(
+                "reranker_failure_strategy must be reject, vector, or llm"
+            )
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_reranker_fallback(self):
+        if (
+            self.reranker_failure_strategy == "vector"
+            and self.retrieval_min_score is None
+        ):
+            raise ValueError(
+                "retrieval_min_score is required when reranker_failure_strategy=vector"
+            )
+        return self
+
     @field_validator("web_search_provider")
     @classmethod
     def supported_web_search_provider(cls, value: str) -> str:
         normalized = value.strip().lower()
-        if normalized != "mock":
-            raise ValueError("web_search_provider must be mock")
+        if normalized != "tavily":
+            raise ValueError("web_search_provider must be tavily")
         return normalized
 
     @field_validator(
         "web_search_max_queries",
         "web_search_result_count",
+        "web_search_timeout_seconds",
         "query_rewrite_max_queries",
     )
     @classmethod
     def positive_counts(cls, value: int) -> int:
         return max(1, value)
+
+    @field_validator("web_search_max_retries")
+    @classmethod
+    def non_negative_web_search_retries(cls, value: int) -> int:
+        return max(0, value)
+
+    @field_validator("tavily_search_depth")
+    @classmethod
+    def supported_tavily_search_depth(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"basic", "advanced"}:
+            raise ValueError("tavily_search_depth must be basic or advanced")
+        return normalized
+
+    @field_validator("tavily_topic")
+    @classmethod
+    def supported_tavily_topic(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"general", "news", "finance"}:
+            raise ValueError("tavily_topic must be general, news, or finance")
+        return normalized
 
     @field_validator("query_rewrite_types", mode="before")
     @classmethod

@@ -49,6 +49,8 @@ def ready(response: Response) -> dict:
             and settings.embedding_api_key
             and settings.embedding_model
         ),
+        "reranker": lambda: _reranker_ready(),
+        "web_search": lambda: _web_search_ready(),
     }
     for name, check in checks.items():
         try:
@@ -68,3 +70,17 @@ def ready(response: Response) -> dict:
 def _mysql_ready() -> bool:
     with SessionLocal() as db:
         return db.scalar(text("SELECT 1")) == 1
+
+
+def _reranker_ready() -> bool:
+    if settings.reranker_type != "external":
+        return False
+    return bool(settings.reranker_endpoint and settings.reranker_model)
+
+
+def _web_search_ready() -> bool:
+    if not settings.web_search_enabled:
+        return True
+    if settings.web_search_provider != "tavily":
+        return False
+    return bool(settings.tavily_endpoint and settings.tavily_api_key)

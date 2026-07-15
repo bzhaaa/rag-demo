@@ -1,8 +1,14 @@
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 
-from app.config import get_settings
+from app.config import Settings
 from app.rag import RAGService, parse_relevance
+from app.rag.model_gateway import (
+    EvidenceRouteDecision,
+    RelevanceGrade,
+    parse_structured_model_output,
+)
 from app.services import validate_upload
 from app.vector_store import chunk_id
 
@@ -28,11 +34,38 @@ def test_parse_relevance_json():
     assert not parse_relevance('prefix {"score":"no"} suffix')
 
 
+def test_parse_relevance_llm_output_variants():
+    assert parse_relevance('```json\n{"score":"yes"}\n```')
+    assert parse_relevance('{"relevant": true}')
+    assert parse_relevance("是")
+    assert parse_relevance("YES")
+    assert not parse_relevance('{"score":"no"}')
+    assert not parse_relevance("否")
+
+
+def test_structured_model_output_uses_pydantic_schema():
+    result = parse_structured_model_output(
+        'prefix ```json\n{"score":"yes"}\n``` suffix',
+        RelevanceGrade,
+    )
+    assert result.score == "yes"
+
+    with pytest.raises(ValidationError):
+        parse_structured_model_output('{"score":"maybe"}', RelevanceGrade)
+
+    with pytest.raises(ValidationError):
+        parse_structured_model_output(
+            '{"route":"internet"}',
+            EvidenceRouteDecision,
+        )
+
+
 def test_structured_refusal_without_evidence():
     service = RAGService.__new__(RAGService)
-    service.settings = get_settings()
+    service.settings = Settings(web_search_enabled=False)
     result = service._generate(
         {"question": "unknown", "relevant": [], "timings": {}}
     )
     assert result["refused"] is True
     assert result["refusal_reason"] == "insufficient_authorized_evidence"
+    assert result["refusal_detail"] == "no_relevant_evidence"

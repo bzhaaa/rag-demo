@@ -1,3 +1,4 @@
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol, Sequence, TypedDict, Union
 
 
@@ -13,12 +14,15 @@ class RAGState(TypedDict, total=False):
     evidence_route: str
     evidence_routing_failed: bool
     web_search_attempted: bool
+    web_search_failed: bool
     answer: str
     cited_indices: List[int]
     query_rewrite_attempted: bool
     refused: bool
     refusal_reason: Optional[str]
+    refusal_detail: Optional[str]
     timings: Dict[str, float]
+    diagnostics: Dict[str, Any]
 
 
 class RAGModelGateway(Protocol):
@@ -75,8 +79,16 @@ class CandidateReranker(Protocol):
         ...
 
 
+@dataclass
+class WebSearchResponse:
+    results: List[Dict[str, Any]]
+    diagnostics: Dict[str, Any] = field(default_factory=dict)
+
+
 class WebSearchProvider(Protocol):
     name: str
 
-    def search(self, query: str, limit: int) -> List[Dict[str, Any]]:
+    def search(
+        self, query: str, limit: int
+    ) -> Union[List[Dict[str, Any]], WebSearchResponse]:
         ...

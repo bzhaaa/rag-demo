@@ -105,6 +105,7 @@ class QueryResponse(BaseModel):
     citations: list[Citation]
     refused: bool
     refusal_reason: Optional[str] = None
+    refusal_detail: Optional[str] = None
     trace_id: Optional[str] = None
     timings: dict[str, float] = Field(default_factory=dict)
 

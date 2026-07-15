@@ -1,9 +1,14 @@
+import math
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import requests
 
 from app.config import Settings
 from app.rag.types import CandidateReranker
+
+
+class RerankerError(RuntimeError):
+    pass
 
 
 class DefaultCandidateReranker:
@@ -68,21 +73,19 @@ class ExternalCandidateReranker:
         model: str = "",
         api_key: str = "",
         timeout_seconds: int = 45,
-        fallback: Optional[CandidateReranker] = None,
         post: Optional[Callable[..., Any]] = None,
     ) -> None:
         self.endpoint = endpoint
         self.model = model
         self.api_key = api_key
         self.timeout_seconds = timeout_seconds
-        self.fallback = fallback or DefaultCandidateReranker()
         self.post = post or requests.post
 
     def rerank(
         self, question: str, candidates: Sequence[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
         if not self.endpoint or not candidates:
-            return self.fallback.rerank(question, candidates)
+            return []
         documents = [str(candidate.get("content") or "") for candidate in candidates]
         payload: Dict[str, Any] = {
             "query": question,
@@ -102,10 +105,8 @@ class ExternalCandidateReranker:
             )
             response.raise_for_status()
             scores = self._parse_scores(response.json(), len(candidates))
-        except Exception:
-            return self.fallback.rerank(question, candidates)
-        if not scores:
-            return self.fallback.rerank(question, candidates)
+        except Exception as exc:
+            raise RerankerError(str(exc)) from exc
         ranked = []
         for index, score in scores:
             candidate = dict(candidates[index])
@@ -117,18 +118,28 @@ class ExternalCandidateReranker:
     def _parse_scores(data: Any, candidate_count: int) -> List[tuple[int, float]]:
         raw_items = data
         if isinstance(data, dict):
-            raw_items = data.get("results", data.get("data", []))
+            if "results" in data:
+                raw_items = data["results"]
+            elif "data" in data:
+                raw_items = data["data"]
+            else:
+                raise ValueError("reranker response must contain results or data")
         if not isinstance(raw_items, list):
-            return []
+            raise ValueError("reranker results or data must be a list")
         scores: List[tuple[int, float]] = []
         for position, item in enumerate(raw_items):
             if not isinstance(item, dict):
                 continue
             index = int(item.get("index", position))
             if index < 0 or index >= candidate_count:
-                continue
+                raise ValueError("reranker index out of range")
             raw_score = item.get("relevance_score", item.get("score", 0))
-            scores.append((index, float(raw_score)))
+            score = float(raw_score)
+            if not math.isfinite(score) or score < 0 or score > 1:
+                raise ValueError("relevance_score must be between 0 and 1")
+            if any(existing_index == index for existing_index, _ in scores):
+                raise ValueError("duplicate reranker index")
+            scores.append((index, score))
         scores.sort(key=lambda item: item[1], reverse=True)
         return scores
 
@@ -146,6 +157,5 @@ def create_candidate_reranker(settings: Settings) -> CandidateReranker:
             model=settings.reranker_model,
             api_key=settings.reranker_api_key,
             timeout_seconds=settings.model_timeout_seconds,
-            fallback=fallback,
         )
     return fallback

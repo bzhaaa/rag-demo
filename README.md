@@ -12,7 +12,7 @@
 - Milvus：保存 chunk、Embedding 和检索元数据，查询前由后端生成授权版本过滤条件。
 - LangGraph：并行相关性评分、证据判断和答案生成。
 
-正式问答不会使用 Mock Search 内容。授权知识不足时返回结构化拒答。
+授权知识不足时可通过 Tavily Search API 获取真实外部候选，候选必须经过专业 Reranker 后才能用于答案生成。Tavily 故障时返回结构化拒答，不使用 Mock 或未经验证的替代内容。
 
 ## Quick Start
 
@@ -33,7 +33,10 @@ EMBEDDING_API_KEY=...
 EMBEDDING_BASE_URL=...
 EMBEDDING_MODEL=...
 EMBEDDING_DIMENSION=1024
+TAVILY_API_KEY=...
 ```
+
+`TAVILY_API_KEY` 用于默认开启的真实 Web Search。未配置时进程可以启动，但 `/health/ready` 会返回 503。外部搜索会产生费用并发送用户的搜索问题，生产环境应使用 Docker Secret 或企业密钥服务。
 
 `EMBEDDING_DIMENSION` 必须与百炼 Embedding 模型实际输出维度一致。生产环境应使用 Docker Secret 或企业密钥服务，并保持：
 

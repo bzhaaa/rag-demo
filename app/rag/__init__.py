@@ -4,6 +4,7 @@ from app.rag.rerankers import (
     DefaultCandidateReranker,
     ExternalCandidateReranker,
     IdentityCandidateReranker,
+    RerankerError,
     create_candidate_reranker,
 )
 from app.rag.service import RAGService, get_rag_service
@@ -13,11 +14,14 @@ from app.rag.types import (
     RAGModelGateway,
     RAGState,
     WebSearchProvider,
+    WebSearchResponse,
 )
 from app.rag.utils import normalize_query, parse_relevance, valid_citation_indices
 from app.rag.web_search import (
     DisabledWebSearchProvider,
     MockWebSearchProvider,
+    TavilyWebSearchProvider,
+    WebSearchError,
     create_web_search_provider,
 )
 
@@ -34,7 +38,11 @@ __all__ = [
     "RAGModelGateway",
     "RAGService",
     "RAGState",
+    "RerankerError",
+    "TavilyWebSearchProvider",
     "WebSearchProvider",
+    "WebSearchError",
+    "WebSearchResponse",
     "create_candidate_reranker",
     "create_chat_model",
     "create_query_preprocessor",

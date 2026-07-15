@@ -27,4 +27,4 @@
 - `document_uuid` 和 `version`：知识库证据返回对应值，网络证据为 `null`。
 - `document_title`、`page_number`、`chunk_id` 和 `excerpt`。
 
-网络降级默认关闭。启用后，知识库证据可由三档路由选择为纯知识库、纯网络或混合证据。首版网络 provider 是 Mock，结果使用 `example.com`，不能视为真实外部事实。
+网络降级默认开启，使用 Tavily Search API。知识库证据可由三档路由选择为纯知识库、纯网络或混合证据；Web 候选仍须通过专业 Reranker 后才能用于生成。Tavily 故障时返回结构化拒答 `web_search_failed`，不会使用 Mock 或未经验证的替代内容。外部搜索会产生费用并发送用户搜索问题，生产环境应配置密钥管理、出域控制和审计策略。
