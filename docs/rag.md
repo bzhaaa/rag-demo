@@ -8,7 +8,8 @@ RAG 子系统包括：
 
 - 文档校验、解析、切分、Embedding 和 Milvus 索引。
 - 基于当前用户授权范围的活跃文档版本检索。
-- 通过 LangGraph 编排的 LLM 相关性评分和答案生成。
+- 通过 LangGraph 编排的 LLM 相关性评分、三档证据路由和答案生成。
+- 知识库证据不足时可选的 Mock 网络搜索降级。
 - 引用、会话持久化、查询耗时指标和审计日志。
 
 不包括 Streamlit UI 细节、通用账号管理，也不展开非查询业务 API；只有上传和版本接口作为索引入口时会被提到。
@@ -21,10 +22,11 @@ RAG 子系统包括：
 - `app/ingestion.py`：抽取文本并构建 chunk 元数据。
 - `app/vector_store.py`：负责 Milvus collection schema、Embedding 调用、带过滤条件的检索、向量写入/删除和元数据同步。
 - `app/repositories.py`：解析当前用户可访问的活跃文档版本。
-- `app/rag/service.py`：RAGService 和 LangGraph 编排，负责授权检索、纠错分支、生成、引用和持久化。
-- `app/rag/model_gateway.py`：LLM 调用入口，负责相关性评分、答案生成、Direct、HyDE、Step-back 和 Multi-query。
+- `app/rag/service.py`：RAGService 和 LangGraph 编排，负责授权检索、三档证据路由、网络降级、生成、引用和持久化。
+- `app/rag/model_gateway.py`：LLM 调用入口，负责相关性评分、证据路由、答案生成、Direct、HyDE、Step-back 和 Multi-query。
 - `app/rag/preprocessors.py`：Query 预处理协议实现和策略组合。
 - `app/rag/rerankers.py`：本地、透传和外部 HTTP reranker 实现。
+- `app/rag/web_search.py`：网络搜索协议实现、Mock provider 和网络结果标准化。
 - `app/rag/types.py`：RAG 状态和组件 Protocol。
 - `app/rag/utils.py`：查询规范化、候选合并、引用解析等无状态工具。
 - `app/rag/__init__.py`：兼容导出层，保留 `from app.rag import RAGService` 等旧导入方式。
@@ -51,11 +53,16 @@ flowchart LR
     Versions --> Preprocess["LangGraph: Query 预处理"]
     Preprocess --> Search["多查询初次授权检索"]
     Search --> Grade["LangGraph: 重排与相关性评分"]
-    Grade --> Enough{"证据足够？"}
-    Enough -->|是| Generate["LangGraph: 生成与引用校验"]
-    Enough -->|否| Rewrite["LangGraph: 查询改写"]
-    Rewrite --> Search2["二次授权检索并合并去重"]
-    Search2 --> Grade
+    Grade --> WebEnabled{"启用网络降级？"}
+    WebEnabled -->|否| SelectKB["选择知识库证据或拒答"]
+    WebEnabled -->|是| Route{"LLM 三档证据路由"}
+    Route -->|knowledge_base| SelectKB
+    Route -->|web| WebSearch["Mock 网络搜索"]
+    Route -->|hybrid| WebSearch
+    WebSearch --> WebGrade["网络结果重排与相关性评分"]
+    WebGrade --> Select["按路由选择最终证据"]
+    SelectKB --> Generate["LangGraph: 生成与引用校验"]
+    Select --> Generate
     Generate --> Save["消息、引用、指标、审计"]
     Save --> Response["QueryResponse"]
 ```
@@ -77,11 +84,13 @@ flowchart LR
 3. `preprocess_query` 在初次检索前按配置执行 Query 预处理，生成去重后的检索查询列表；用户原始问题保持不变，仍用于最终答案生成。
 4. `retrieve` 对预处理后的查询逐个执行 Milvus 检索。`MilvusChunkStore.search` 对查询做 Embedding，并应用表达式：`version_uuid in [...]`。多查询结果按 `chunk_id` 合并，同一 chunk 保留最高分。
 5. `grade_documents` 先按 `RERANKER_TYPE` 选择候选重排策略，然后按配置决定是否执行 LLM 相关性评分。内置默认重排会过滤空内容和可选低分候选、按标准化内容去重、按分数排序、限制单文档 chunk 数。
-6. 如果相关证据不足且尚未补救，`rewrite_and_retrieve` 再次使用 Query 预处理器生成新的 corrective 查询，并且只在同一组授权版本 UUID 内二次检索。二次候选按 `chunk_id` 合并去重。
-7. `generate` 只基于授权证据生成中文答案，并校验答案中的 `[n]` 引用。无引用或越界引用会严格重试一次；仍失败则返回 `refusal_reason = invalid_citations`。
-8. `RAGService._citations` 只返回答案实际引用的 chunks，而不是全部候选证据。
-9. 用户消息和助手消息会持久化，助手消息包含引用、模型名、`trace_id` 和耗时指标。
-10. `query.execute` 审计日志记录 trace ID、是否拒答和引用数量。
+6. 网络搜索关闭时，知识库证据达到最低数量后直接生成，否则返回 `insufficient_authorized_evidence`。
+7. 网络搜索开启时，`route_evidence` 让 LLM 在 `knowledge_base`、`web` 和 `hybrid` 中选择。非法 JSON、超时或异常会保守拒答，不触发网络搜索。
+8. `web` 和 `hybrid` 路由复用预处理查询，最多使用 `WEB_SEARCH_MAX_QUERIES` 个查询。首版 provider 是进程内 Mock，不发起真实 HTTP 请求；结果按 URL 去重并保留最高分。
+9. 网络结果使用与知识库相同的 reranker、LLM 相关性评分和评分熔断。`web` 只使用网络证据；`hybrid` 必须同时有知识库和网络证据，并按知识库优先排列。
+10. `generate` 根据最终证据生成中文答案，并校验答案中的 `[n]` 引用。无引用或越界引用会严格重试一次；仍失败则返回 `invalid_citations`。
+11. `RAGService._citations` 只返回答案实际引用的证据。网络引用包含 `source_type = web` 和 URL，知识库引用包含原有文档和版本信息。
+12. 用户消息和助手消息会持久化；审计日志额外记录最终路由、是否尝试网络搜索、两类证据数量和 provider。
 
 ## 授权不变量
 
@@ -89,8 +98,10 @@ flowchart LR
 - 用户只能检索自己可访问的活跃文档版本。
 - 管理员可访问所有未删除文档；其他用户可访问自己拥有的、部门可见的、用户 ACL 授权的或部门 ACL 授权的文档。
 - 查询客户端无法扩大检索范围。
-- 授权证据缺失或不足时，生成阶段返回结构化拒答，`refusal_reason = insufficient_authorized_evidence`。
+- 网络搜索关闭且授权证据不足时，返回 `insufficient_authorized_evidence`。
+- 网络搜索开启后，路由失败、搜索无结果、相关性评分失败或最终证据不足时，返回 `insufficient_evidence`。
 - 查询改写不会访问外部网络，也不会改变授权版本集合。
+- 网络来源不具有企业授权证据语义，必须在引用中标记为 `web`。
 - 答案缺少有效引用时返回结构化拒答，`refusal_reason = invalid_citations`。
 
 ## Query 预处理
@@ -114,9 +125,30 @@ flowchart LR
 - 第一项始终是规范化后的用户原问题。
 - 查询按规范化文本去重。
 - 初次检索最多使用 `QUERY_REWRITE_MAX_QUERIES` 个查询。默认启用 `normalize,direct,multi_query`，HyDE 和 Step-back 建议按知识库场景显式开启。
-- corrective 检索最多使用 `QUERY_REWRITE_CORRECTIVE_MAX_QUERIES` 个尚未检索过的新查询。
 - LLM 改写失败时保留规范化原问题，不中断 RAG 请求。
 - 所有查询只用于检索；最终生成仍使用用户原始问题。
+
+## CRAG 三档路由与网络降级
+
+`WEB_SEARCH_ENABLED=false` 是默认值。关闭时不会调用证据路由模型或网络 provider，行为保持为严格的授权知识库 RAG。
+
+开启后，初次知识库检索和评分完成时，模型必须返回：
+
+```json
+{"route": "knowledge_base|web|hybrid"}
+```
+
+- `knowledge_base`：知识库证据足以独立回答，不调用网络搜索。
+- `web`：放弃知识库弱证据，只使用通过重排和评分的网络结果。
+- `hybrid`：同时使用知识库和网络证据。任一侧没有相关证据时拒答。
+
+首版 `WEB_SEARCH_PROVIDER=mock` 内置 3 条明确标记为 Mock 的 RAG/CRAG 示例结果，URL 使用 `example.com`。它只用于测试和开发演示，不能作为真实事实来源。`create_web_search_provider` 和 `WebSearchProvider` 已预留后续 Tavily、Bing 或自建 HTTP 适配器的接入位置。
+
+新增耗时项：
+
+- `evidence_routing`
+- `web_search`
+- `web_grading`
 
 ## Reranker 策略
 
@@ -177,7 +209,10 @@ flowchart LR
 - `QUERY_REWRITE_ENABLED`
 - `QUERY_REWRITE_TYPES`
 - `QUERY_REWRITE_MAX_QUERIES`
-- `QUERY_REWRITE_CORRECTIVE_MAX_QUERIES`
+- `WEB_SEARCH_ENABLED`
+- `WEB_SEARCH_PROVIDER`
+- `WEB_SEARCH_MAX_QUERIES`
+- `WEB_SEARCH_RESULT_COUNT`
 - `RERANKER_TYPE`
 - `RERANKER_ENDPOINT`
 - `RERANKER_API_KEY`
@@ -207,14 +242,17 @@ flowchart LR
 - 候选过滤、去重、排序和单文档 chunk 限额。
 - Reranker 配置选择和外部 reranker 请求/排序。
 - Query normalize、direct、HyDE、Step-back、多查询扩展、配置组合和结果去重。
-- 初检前多查询授权检索，以及证据不足后的 corrective 查询扩展。
+- 初检前多查询授权检索，且不会执行第二轮知识库检索。
+- `knowledge_base`、`web`、`hybrid` 三档路由和路由失败时的保守拒答。
+- Mock 网络搜索默认关闭、查询数量限制、URL 去重、稳定 chunk ID。
+- 网络结果重排和相关性评分、web 评分失败拒答、混合证据来源完整性。
 - 引用校验、严格重试、只返回实际引用 chunks 和 `invalid_citations` 拒答。
-- 初次证据不足时的一轮查询改写、二次授权检索和候选合并去重。
+- 知识库与网络引用结构、消息指标和路由审计信息持久化。
 
 建议补充：
 
 - 覆盖 owner、department、显式 ACL、admin 路径下的授权版本过滤。
-- 覆盖评分失败和熔断行为。
 - 覆盖 chunks 指向已删除或不可访问文档时的引用组装。
+- 接入真实网络搜索 provider 后增加 HTTP 超时、重试、速率限制和域名策略测试。
 - 增加带 opt-in 标记的 Milvus insert/search/delete 集成测试。
 - 增加离线评估集，跟踪 Recall@K、引用准确率和事实一致性。

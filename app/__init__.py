@@ -1,1 +1,1 @@
-"""Enterprise Corrective RAG application package."""
+"""Enterprise CRAG application package."""

@@ -7,9 +7,14 @@ class RAGState(TypedDict, total=False):
     version_uuids: List[str]
     candidates: List[Dict[str, Any]]
     relevant: List[Dict[str, Any]]
+    web_candidates: List[Dict[str, Any]]
+    web_relevant: List[Dict[str, Any]]
+    evidence: List[Dict[str, Any]]
+    evidence_route: str
+    evidence_routing_failed: bool
+    web_search_attempted: bool
     answer: str
     cited_indices: List[int]
-    corrective_attempted: bool
     query_rewrite_attempted: bool
     refused: bool
     refusal_reason: Optional[str]
@@ -45,6 +50,13 @@ class RAGModelGateway(Protocol):
     def rewrite_step_back_query(self, question: str) -> str:
         ...
 
+    def route_evidence(
+        self,
+        question: str,
+        evidence: Sequence[Dict[str, Any]],
+    ) -> str:
+        ...
+
 
 class QueryPreprocessor(Protocol):
     def preprocess(
@@ -60,4 +72,11 @@ class CandidateReranker(Protocol):
     def rerank(
         self, question: str, candidates: Sequence[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
+        ...
+
+
+class WebSearchProvider(Protocol):
+    name: str
+
+    def search(self, query: str, limit: int) -> List[Dict[str, Any]]:
         ...

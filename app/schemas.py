@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -84,9 +84,11 @@ class JobResponse(ORMModel):
 
 
 class Citation(BaseModel):
-    document_uuid: str
+    source_type: Literal["knowledge_base", "web"] = "knowledge_base"
+    url: Optional[str] = None
+    document_uuid: Optional[str]
     document_title: str
-    version: int
+    version: Optional[int]
     page_number: Optional[int]
     chunk_id: str
     excerpt: str

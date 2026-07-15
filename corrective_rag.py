@@ -165,14 +165,26 @@ with query_tab:
             else:
                 st.markdown(result["answer"])
             for index, citation in enumerate(result["citations"], start=1):
-                with st.expander(
-                    f"[{index}] {citation['document_title']} "
-                    f"v{citation['version']}"
-                ):
-                    st.caption(
-                        f"Page {citation.get('page_number') or '-'} | "
-                        f"{citation['chunk_id']}"
+                if citation.get("source_type") == "web":
+                    label = f"[{index}] {citation['document_title']} (Web)"
+                else:
+                    label = (
+                        f"[{index}] {citation['document_title']} "
+                        f"v{citation['version']}"
                     )
+                with st.expander(
+                    label
+                ):
+                    if citation.get("source_type") == "web":
+                        st.caption(
+                            f"{citation.get('url') or '-'} | "
+                            f"{citation['chunk_id']}"
+                        )
+                    else:
+                        st.caption(
+                            f"Page {citation.get('page_number') or '-'} | "
+                            f"{citation['chunk_id']}"
+                        )
                     st.write(citation["excerpt"])
             st.caption(
                 f"Trace: {result.get('trace_id')} | "

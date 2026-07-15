@@ -3,15 +3,18 @@ from typing import Any, Dict, List, Sequence
 from sqlalchemy import select
 
 from app.config import Settings
-from app.models import Message
+from app.models import AuditLog, Message
 from app.rag import (
     DefaultCandidateReranker,
     DefaultQueryPreprocessor,
     ExternalCandidateReranker,
     IdentityCandidateReranker,
+    MockWebSearchProvider,
     RAGService,
     create_candidate_reranker,
+    create_web_search_provider,
 )
+from app.schemas import Citation
 
 
 class FakeVectorStore:
@@ -36,6 +39,7 @@ class FakeModelGateway:
         direct_rewrite: str = "",
         hyde_document: str = "",
         step_back_query: str = "",
+        routes: Sequence[object] = (),
     ) -> None:
         self.answers = list(answers)
         self.relevance = list(relevance)
@@ -44,11 +48,13 @@ class FakeModelGateway:
         self.direct_rewrite = direct_rewrite
         self.hyde_document = hyde_document
         self.step_back_query = step_back_query
+        self.routes = list(routes)
         self.generate_calls: List[bool] = []
         self.rewrite_calls = 0
         self.standalone_calls = 0
         self.hyde_calls = 0
         self.step_back_calls = 0
+        self.route_calls = 0
 
     def grade_relevance(
         self,
@@ -90,6 +96,31 @@ class FakeModelGateway:
     def rewrite_step_back_query(self, question: str) -> str:
         self.step_back_calls += 1
         return self.step_back_query
+
+    def route_evidence(
+        self,
+        question: str,
+        evidence: Sequence[Dict[str, Any]],
+    ) -> str:
+        self.route_calls += 1
+        if not self.routes:
+            return "knowledge_base"
+        route = self.routes.pop(0)
+        if isinstance(route, Exception):
+            raise route
+        return str(route)
+
+
+class FakeWebSearchProvider:
+    name = "fake"
+
+    def __init__(self, results: Dict[str, List[Dict[str, Any]]]) -> None:
+        self.results = results
+        self.calls: List[tuple[str, int]] = []
+
+    def search(self, query: str, limit: int) -> List[Dict[str, Any]]:
+        self.calls.append((query, limit))
+        return list(self.results.get(query, []))
 
 
 def create_rag_user_and_document(db, models):
@@ -164,6 +195,67 @@ def test_answer_uses_authorized_versions_and_persists_complete_metrics(db_sessio
     assert result["timings"]["total"] >= 0
     messages = list(db.scalars(select(Message).order_by(Message.id)))
     assert messages[-1].metrics == result["timings"]
+
+
+def test_web_route_uses_injected_provider_and_returns_web_citation(db_session):
+    db, models = db_session
+    user, document, version = create_rag_user_and_document(db, models)
+    knowledge_chunk = make_chunk(
+        document,
+        version,
+        0,
+        "Partial internal evidence that must be discarded by the web route.",
+    )
+    vector_store = FakeVectorStore({"CRAG": [knowledge_chunk]})
+    web_search = FakeWebSearchProvider(
+        {
+            "CRAG": [
+                {
+                    "title": "Mock CRAG Guide",
+                    "url": "https://example.com/mock-crag",
+                    "content": "CRAG can fall back to external search.",
+                    "score": 0.95,
+                }
+            ]
+        }
+    )
+    gateway = FakeModelGateway(
+        answers=["Use external search when internal evidence is insufficient [1]."],
+        relevance=[True, True],
+        routes=["web"],
+    )
+    service = RAGService(
+        vector_store=vector_store,
+        model_gateway=gateway,
+        web_search_provider=web_search,
+        settings=Settings(
+            web_search_enabled=True,
+            query_rewrite_types="normalize",
+        ),
+    )
+
+    result = service.answer(db, user, "CRAG")
+
+    assert result["refused"] is False
+    assert web_search.calls == [("CRAG", 5)]
+    assert knowledge_chunk["chunk_id"] not in {
+        item["chunk_id"] for item in result["citations"]
+    }
+    assert result["citations"] == [
+        {
+            "source_type": "web",
+            "url": "https://example.com/mock-crag",
+            "document_uuid": None,
+            "document_title": "Mock CRAG Guide",
+            "version": None,
+            "page_number": None,
+            "chunk_id": result["citations"][0]["chunk_id"],
+            "excerpt": "CRAG can fall back to external search.",
+        }
+    ]
+    assert "evidence_routing" in result["timings"]
+    assert "web_search" in result["timings"]
+    assert "web_grading" in result["timings"]
 
 
 def test_default_reranker_filters_deduplicates_sorts_and_limits_documents():
@@ -468,24 +560,21 @@ def test_invalid_citations_after_retry_returns_structured_refusal(db_session):
     assert result["citations"] == []
 
 
-def test_corrective_rag_rewrites_once_when_initial_evidence_is_insufficient(
+def test_initial_preprocessed_queries_are_the_only_knowledge_retrieval(
     db_session,
 ):
     db, models = db_session
     user, document, version = create_rag_user_and_document(db, models)
     first = make_chunk(document, version, 0, "无关内容。", score=0.2)
-    rewritten = make_chunk(document, version, 1, "改写查询找到的授权证据。", score=0.95)
     vector_store = FakeVectorStore(
         {
             "原始问题": [first],
             "初检无关": [first],
-            "改写一": [rewritten],
-            "改写二": [rewritten],
         }
     )
     gateway = FakeModelGateway(
-        ["改写查询找到了答案。[1]"],
-        relevance=[False, True],
+        [],
+        relevance=[False],
         rewrite_batches=[["初检无关"], ["改写一", "改写二"]],
     )
     preprocessor = DefaultQueryPreprocessor(
@@ -501,20 +590,18 @@ def test_corrective_rag_rewrites_once_when_initial_evidence_is_insufficient(
 
     result = service.answer(db, user, "原始问题")
 
-    assert result["refused"] is False
-    assert gateway.rewrite_calls == 2
+    assert result["refused"] is True
+    assert result["refusal_reason"] == "insufficient_authorized_evidence"
+    assert gateway.rewrite_calls == 1
     assert [call[0] for call in vector_store.calls] == [
         "原始问题",
         "初检无关",
-        "改写一",
-        "改写二",
     ]
     assert all(call[1] == [version.uuid] for call in vector_store.calls)
-    assert [item["chunk_id"] for item in result["citations"]] == [
-        rewritten["chunk_id"]
-    ]
-    assert "query_rewrite" in result["timings"]
-    assert "corrective_retrieval" in result["timings"]
+    assert "query_rewrite" not in result["timings"]
+    assert set(result["timings"]).isdisjoint(
+        {"query_rewrite", "corrective_retrieval"}
+    )
 
 
 def test_initial_retrieval_uses_preprocessed_queries_with_same_authorization(
@@ -561,7 +648,7 @@ def test_initial_retrieval_uses_preprocessed_queries_with_same_authorization(
     assert "query_preprocess" in result["timings"]
 
 
-def test_corrective_rag_does_not_rewrite_when_initial_evidence_is_sufficient(
+def test_initial_query_rewrite_does_not_repeat_when_evidence_is_sufficient(
     db_session,
 ):
     db, models = db_session
@@ -603,7 +690,7 @@ def test_grading_failures_open_circuit_and_refuse_conservatively(db_session):
     assert service._grading_circuit_is_open()
 
 
-def test_failed_query_rewrite_keeps_insufficient_evidence_refusal(db_session):
+def test_initial_query_rewrite_failure_keeps_authorized_evidence_refusal(db_session):
     db, models = db_session
     user, document, version = create_rag_user_and_document(db, models)
     chunk = make_chunk(document, version, 0, "无关内容。")
@@ -619,5 +706,322 @@ def test_failed_query_rewrite_keeps_insufficient_evidence_refusal(db_session):
 
     assert result["refused"] is True
     assert result["refusal_reason"] == "insufficient_authorized_evidence"
-    assert gateway.rewrite_calls == 2
+    assert gateway.rewrite_calls == 1
     assert [call[0] for call in vector_store.calls] == ["问题"]
+
+
+def test_knowledge_base_route_does_not_call_web_search(db_session):
+    db, models = db_session
+    user, document, version = create_rag_user_and_document(db, models)
+    chunk = make_chunk(document, version, 0, "Authorized answer.")
+    vector_store = FakeVectorStore({"policy": [chunk]})
+    web_search = FakeWebSearchProvider({})
+    gateway = FakeModelGateway(
+        answers=["Authorized answer [1]."],
+        relevance=[True],
+        routes=["knowledge_base"],
+    )
+    service = RAGService(
+        vector_store=vector_store,
+        model_gateway=gateway,
+        web_search_provider=web_search,
+        settings=Settings(
+            web_search_enabled=True,
+            query_rewrite_types="normalize",
+        ),
+    )
+
+    result = service.answer(db, user, "policy")
+
+    assert result["refused"] is False
+    assert web_search.calls == []
+    assert result["citations"][0]["source_type"] == "knowledge_base"
+    assert result["citations"][0]["url"] is None
+
+
+def test_hybrid_route_uses_knowledge_first_and_persists_audit_details(db_session):
+    db, models = db_session
+    user, document, version = create_rag_user_and_document(db, models)
+    chunk = make_chunk(document, version, 0, "Internal policy evidence.")
+    vector_store = FakeVectorStore({"policy": [chunk]})
+    web_search = FakeWebSearchProvider(
+        {
+            "policy": [
+                {
+                    "title": "External context",
+                    "url": "https://example.com/external-context",
+                    "content": "Public supporting evidence.",
+                    "score": 0.9,
+                }
+            ]
+        }
+    )
+    gateway = FakeModelGateway(
+        answers=["Internal policy [1] is supplemented by public context [2]."],
+        relevance=[True, True],
+        routes=["hybrid"],
+    )
+    service = RAGService(
+        vector_store=vector_store,
+        model_gateway=gateway,
+        web_search_provider=web_search,
+        settings=Settings(
+            web_search_enabled=True,
+            query_rewrite_types="normalize",
+        ),
+    )
+
+    result = service.answer(db, user, "policy")
+
+    assert result["refused"] is False
+    assert [item["source_type"] for item in result["citations"]] == [
+        "knowledge_base",
+        "web",
+    ]
+    audit = db.scalar(select(AuditLog).order_by(AuditLog.id.desc()))
+    assert audit.details["evidence_route"] == "hybrid"
+    assert audit.details["web_search_attempted"] is True
+    assert audit.details["knowledge_evidence_count"] == 1
+    assert audit.details["web_evidence_count"] == 1
+    assert audit.details["web_search_provider"] == "fake"
+    messages = list(db.scalars(select(Message).order_by(Message.id)))
+    assert messages[-1].citations == result["citations"]
+
+
+def test_hybrid_route_refuses_when_one_evidence_source_is_missing(db_session):
+    db, models = db_session
+    user, document, version = create_rag_user_and_document(db, models)
+    chunk = make_chunk(document, version, 0, "Internal policy evidence.")
+    gateway = FakeModelGateway(
+        answers=[],
+        relevance=[True],
+        routes=["hybrid"],
+    )
+    service = RAGService(
+        vector_store=FakeVectorStore({"policy": [chunk]}),
+        model_gateway=gateway,
+        web_search_provider=FakeWebSearchProvider({}),
+        settings=Settings(
+            web_search_enabled=True,
+            query_rewrite_types="normalize",
+        ),
+    )
+
+    result = service.answer(db, user, "policy")
+
+    assert result["refused"] is True
+    assert result["refusal_reason"] == "insufficient_evidence"
+    assert result["citations"] == []
+
+
+def test_evidence_routing_failure_refuses_without_web_search(db_session):
+    db, models = db_session
+    user, _, _ = create_rag_user_and_document(db, models)
+    web_search = FakeWebSearchProvider({})
+    gateway = FakeModelGateway(
+        answers=[],
+        routes=[ValueError("invalid route JSON")],
+    )
+    service = RAGService(
+        vector_store=FakeVectorStore({"question": []}),
+        model_gateway=gateway,
+        web_search_provider=web_search,
+        settings=Settings(
+            web_search_enabled=True,
+            query_rewrite_types="normalize",
+        ),
+    )
+
+    result = service.answer(db, user, "question")
+
+    assert result["refused"] is True
+    assert result["refusal_reason"] == "insufficient_evidence"
+    assert web_search.calls == []
+
+
+def test_web_results_are_deduplicated_by_url_and_keep_highest_score(db_session):
+    db, models = db_session
+    user, _, _ = create_rag_user_and_document(db, models)
+    web_search = FakeWebSearchProvider(
+        {
+            "question": [
+                {
+                    "title": "Low score",
+                    "url": "https://example.com/result",
+                    "content": "Old snippet.",
+                    "score": 0.3,
+                },
+                {
+                    "title": "High score",
+                    "url": "https://example.com/result",
+                    "content": "Best snippet.",
+                    "score": 0.9,
+                },
+            ]
+        }
+    )
+    gateway = FakeModelGateway(
+        answers=["Best snippet [1].", "Best snippet [1]."],
+        relevance=[True, True],
+        routes=["web", "web"],
+    )
+    service = RAGService(
+        vector_store=FakeVectorStore({"question": []}),
+        model_gateway=gateway,
+        web_search_provider=web_search,
+        settings=Settings(
+            web_search_enabled=True,
+            query_rewrite_types="normalize",
+        ),
+    )
+
+    first = service.answer(db, user, "question")
+    second = service.answer(db, user, "question")
+
+    assert first["citations"][0]["document_title"] == "High score"
+    assert first["citations"][0]["excerpt"] == "Best snippet."
+    assert first["citations"][0]["chunk_id"] == second["citations"][0]["chunk_id"]
+
+
+def test_mock_web_search_provider_is_disabled_by_default_and_returns_fixed_results():
+    disabled = create_web_search_provider(Settings())
+    mock = MockWebSearchProvider()
+
+    assert disabled.name == "disabled"
+    assert disabled.search("CRAG", 5) == []
+    results = mock.search("CRAG", 5)
+    assert len(results) == 3
+    assert all(item["url"].startswith("https://example.com/") for item in results)
+    assert all("Mock" in item["title"] for item in results)
+
+
+def test_web_search_reuses_preprocessed_queries_up_to_configured_limit(db_session):
+    db, models = db_session
+    user, _, _ = create_rag_user_and_document(db, models)
+    web_search = FakeWebSearchProvider(
+        {
+            "original": [],
+            "rewrite-one": [
+                {
+                    "title": "Result",
+                    "url": "https://example.com/result",
+                    "content": "Relevant result.",
+                    "score": 0.9,
+                }
+            ],
+        }
+    )
+    gateway = FakeModelGateway(
+        answers=["Relevant result [1]."],
+        relevance=[True],
+        rewrites=["rewrite-one", "rewrite-two"],
+        routes=["web"],
+    )
+    service = RAGService(
+        vector_store=FakeVectorStore({}),
+        model_gateway=gateway,
+        web_search_provider=web_search,
+        settings=Settings(
+            web_search_enabled=True,
+            web_search_max_queries=2,
+            query_rewrite_types="normalize,multi_query",
+            query_rewrite_max_queries=3,
+        ),
+    )
+
+    result = service.answer(db, user, "original")
+
+    assert result["refused"] is False
+    assert web_search.calls == [("original", 5), ("rewrite-one", 5)]
+
+
+def test_web_grading_failure_refuses_without_unverified_evidence(db_session):
+    db, models = db_session
+    user, _, _ = create_rag_user_and_document(db, models)
+    web_search = FakeWebSearchProvider(
+        {
+            "question": [
+                {
+                    "title": "Unverified",
+                    "url": "https://example.com/unverified",
+                    "content": "Unverified content.",
+                    "score": 0.9,
+                }
+            ]
+        }
+    )
+    gateway = FakeModelGateway(
+        answers=[],
+        relevance=[Exception("grader unavailable")],
+        routes=["web"],
+    )
+    service = RAGService(
+        vector_store=FakeVectorStore({"question": []}),
+        model_gateway=gateway,
+        web_search_provider=web_search,
+        settings=Settings(
+            web_search_enabled=True,
+            query_rewrite_types="normalize",
+        ),
+    )
+
+    result = service.answer(db, user, "question")
+
+    assert result["refused"] is True
+    assert result["refusal_reason"] == "insufficient_evidence"
+    assert result["citations"] == []
+
+
+def test_web_provider_failure_returns_structured_refusal(db_session):
+    class FailingWebSearchProvider:
+        name = "failing"
+
+        def search(self, query: str, limit: int) -> List[Dict[str, Any]]:
+            raise TimeoutError("search unavailable")
+
+    db, models = db_session
+    user, _, _ = create_rag_user_and_document(db, models)
+    gateway = FakeModelGateway(answers=[], routes=["web"])
+    service = RAGService(
+        vector_store=FakeVectorStore({"question": []}),
+        model_gateway=gateway,
+        web_search_provider=FailingWebSearchProvider(),
+        settings=Settings(
+            web_search_enabled=True,
+            query_rewrite_types="normalize",
+        ),
+    )
+
+    result = service.answer(db, user, "question")
+
+    assert result["refused"] is True
+    assert result["refusal_reason"] == "insufficient_evidence"
+    assert result["citations"] == []
+
+
+def test_citation_schema_accepts_knowledge_base_and_web_sources():
+    knowledge = Citation(
+        source_type="knowledge_base",
+        url=None,
+        document_uuid="document-uuid",
+        document_title="Policy",
+        version=1,
+        page_number=2,
+        chunk_id="chunk-1",
+        excerpt="Authorized evidence.",
+    )
+    web = Citation(
+        source_type="web",
+        url="https://example.com/source",
+        document_uuid=None,
+        document_title="Public source",
+        version=None,
+        page_number=None,
+        chunk_id="web:source",
+        excerpt="Public evidence.",
+    )
+
+    assert knowledge.document_uuid == "document-uuid"
+    assert knowledge.url is None
+    assert web.document_uuid is None
+    assert web.url == "https://example.com/source"

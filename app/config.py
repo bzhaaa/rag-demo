@@ -14,7 +14,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    app_name: str = "Enterprise Corrective RAG"
+    app_name: str = "Enterprise CRAG"
     environment: str = "development"
     api_prefix: str = "/api/v1"
     secret_key: str = "change-me-in-production"
@@ -57,7 +57,10 @@ class Settings(BaseSettings):
         ]
     )
     query_rewrite_max_queries: int = 3
-    query_rewrite_corrective_max_queries: int = 2
+    web_search_enabled: bool = False
+    web_search_provider: str = "mock"
+    web_search_max_queries: int = 3
+    web_search_result_count: int = 5
     reranker_type: str = "default"
     reranker_endpoint: str = ""
     reranker_api_key: str = ""
@@ -78,7 +81,7 @@ class Settings(BaseSettings):
 
     langsmith_tracing: bool = False
     langsmith_api_key: str = ""
-    langsmith_project: str = "enterprise-corrective-rag"
+    langsmith_project: str = "enterprise-crag"
     langsmith_endpoint: str = ""
     langsmith_hide_inputs: bool = True
     langsmith_hide_outputs: bool = True
@@ -116,6 +119,23 @@ class Settings(BaseSettings):
         if normalized not in {"default", "identity", "external"}:
             raise ValueError("reranker_type must be default, identity, or external")
         return normalized
+
+    @field_validator("web_search_provider")
+    @classmethod
+    def supported_web_search_provider(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized != "mock":
+            raise ValueError("web_search_provider must be mock")
+        return normalized
+
+    @field_validator(
+        "web_search_max_queries",
+        "web_search_result_count",
+        "query_rewrite_max_queries",
+    )
+    @classmethod
+    def positive_counts(cls, value: int) -> int:
+        return max(1, value)
 
     @field_validator("query_rewrite_types", mode="before")
     @classmethod

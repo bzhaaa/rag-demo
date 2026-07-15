@@ -39,11 +39,17 @@ class DefaultCandidateReranker:
         per_document: Dict[str, int] = {}
         result: List[Dict[str, Any]] = []
         for candidate in sorted_candidates:
-            document_uuid = str(candidate.get("document_uuid") or "")
-            count = per_document.get(document_uuid, 0)
+            document_key = str(
+                candidate.get("document_uuid")
+                or candidate.get("url")
+                or candidate.get("source_name")
+                or candidate.get("chunk_id")
+                or ""
+            )
+            count = per_document.get(document_key, 0)
             if count >= self.max_chunks_per_document:
                 continue
-            per_document[document_uuid] = count + 1
+            per_document[document_key] = count + 1
             result.append(candidate)
         return result
 
