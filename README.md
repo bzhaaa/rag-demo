@@ -45,6 +45,22 @@ LANGSMITH_HIDE_INPUTS=true
 LANGSMITH_HIDE_OUTPUTS=true
 ```
 
+Hybrid retrieval uses Milvus dense vector search plus native BM25 sparse search by default:
+
+```dotenv
+MILVUS_COLLECTION=enterprise_rag_chunks_hybrid
+RETRIEVAL_MODE=hybrid
+RETRIEVAL_DENSE_LIMIT=10
+RETRIEVAL_SPARSE_LIMIT=10
+RETRIEVAL_RRF_K=60
+```
+
+After changing from the old dense-only collection, rebuild active ready document versions into the new hybrid collection:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\rebuild_hybrid_index.py
+```
+
 2. 确保本机 Milvus 可通过 `localhost:19530` 访问，然后启动应用：
 
 ```powershell

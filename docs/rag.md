@@ -281,6 +281,38 @@ LANGSMITH_HIDE_OUTPUTS=true
 
 生产环境建议保持 `LANGSMITH_HIDE_INPUTS=true` 和 `LANGSMITH_HIDE_OUTPUTS=true`，避免原始问题、文档片段和答案进入外部观测平台。
 
+## Dense + Sparse Hybrid Retrieval
+
+知识库检索默认使用 Milvus dense vector search 和 Milvus 原生 BM25 sparse search：
+
+```text
+authorized version filter
+-> dense search + sparse BM25 search
+-> RRF fusion
+-> external reranker admission
+-> answer generation
+```
+
+核心配置：
+
+```dotenv
+MILVUS_COLLECTION=enterprise_rag_chunks_hybrid
+RETRIEVAL_MODE=hybrid
+RETRIEVAL_DENSE_LIMIT=10
+RETRIEVAL_SPARSE_LIMIT=10
+RETRIEVAL_RRF_K=60
+```
+
+`RETRIEVAL_MODE` 支持 `dense`、`sparse` 和 `hybrid`。`hybrid` 模式下 dense 与 sparse 两路检索必须使用相同的 `version_uuid in [...]` 授权过滤条件。RRF 融合分数写入候选的 `score`，两路原始分数分别写入 `dense_score` 和 `sparse_score`，命中来源写入 `retrieval_sources`。
+
+从旧 dense-only collection 切换到 hybrid collection 后，需要离线重建索引：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\rebuild_hybrid_index.py
+```
+
+旧 collection 缺少 `sparse_embedding` 字段、content analyzer 或 BM25 function 时，`/health/ready` 会将 Milvus 标记为 unavailable。
+
 ## Milvus Chunk 元数据
 
 每个已索引 chunk 至少包含：
@@ -296,6 +328,7 @@ LANGSMITH_HIDE_OUTPUTS=true
 - `source_name`
 - `content`
 - `embedding`
+- `sparse_embedding`
 
 授权判断在 Milvus 检索前由 MySQL 完成。Milvus 保存检索和过滤所需元数据，但不作为 ACL、任务状态或版本状态的事实来源。
 
@@ -329,7 +362,11 @@ LANGSMITH_HIDE_OUTPUTS=true
 - `RERANKER_MIN_SCORE`
 - `RERANKER_TOP_K`
 - `RERANKER_FAILURE_STRATEGY`
+- `RETRIEVAL_MODE`
 - `RETRIEVAL_CANDIDATE_COUNT`
+- `RETRIEVAL_DENSE_LIMIT`
+- `RETRIEVAL_SPARSE_LIMIT`
+- `RETRIEVAL_RRF_K`
 - `RETRIEVAL_MIN_SCORE`
 - `RETRIEVAL_MAX_CHUNKS_PER_DOCUMENT`
 - `FINAL_CONTEXT_COUNT`

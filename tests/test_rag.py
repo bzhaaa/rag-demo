@@ -1,7 +1,9 @@
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Sequence
 
 import pytest
 import requests
+from pymilvus import DataType, Function, FunctionType
 from sqlalchemy import select
 
 from app.config import Settings
@@ -20,6 +22,13 @@ from app.rag import (
     create_web_search_provider,
 )
 from app.schemas import Citation
+from app.vector_store import (
+    BM25_FUNCTION,
+    CONTENT_FIELD,
+    DENSE_FIELD,
+    SPARSE_FIELD,
+    MilvusChunkStore,
+)
 
 
 class FakeVectorStore:
@@ -256,6 +265,154 @@ def test_answer_uses_authorized_versions_and_persists_complete_metrics(db_sessio
     assert diagnostics["retrieval"]["candidate_count"] == 1
     assert diagnostics["reranking"]["knowledge"]["relevant_count"] == 1
     assert diagnostics["selected_evidence_count"] == 1
+
+
+def test_retrieval_diagnostics_include_hybrid_scores(db_session):
+    db, models = db_session
+    user, document, version = create_rag_user_and_document(db, models)
+    chunk = {
+        **make_chunk(document, version, 0, "制度 A-102 要求审批。[1]"),
+        "score": 1 / 61,
+        "dense_score": 0.78,
+        "sparse_score": 4.2,
+        "retrieval_sources": ["dense", "sparse"],
+    }
+    vector_store = FakeVectorStore({"制度 A-102": [chunk]})
+    gateway = FakeModelGateway(["制度 A-102 要求审批。[1]"])
+    service = RAGService(
+        vector_store=vector_store,
+        model_gateway=gateway,
+        reranker=PassThroughReranker(),
+        settings=Settings(web_search_enabled=False),
+    )
+
+    service.answer(db, user, "制度 A-102")
+
+    message = list(db.scalars(select(Message).order_by(Message.id)))[-1]
+    retrieval = message.metrics["rag_diagnostics"]["retrieval"]
+    assert retrieval["mode"] == "hybrid"
+    assert retrieval["rrf_k"] == 60
+    assert retrieval["dense_hit_count"] == 1
+    assert retrieval["sparse_hit_count"] == 1
+    assert retrieval["fused_candidate_count"] == 1
+    assert retrieval["candidates"][0]["dense_score"] == 0.78
+    assert retrieval["candidates"][0]["sparse_score"] == 4.2
+    assert retrieval["candidates"][0]["retrieval_sources"] == ["dense", "sparse"]
+
+
+def test_settings_validate_hybrid_retrieval_options():
+    assert Settings(retrieval_mode="dense").retrieval_mode == "dense"
+    assert Settings(retrieval_mode="sparse").retrieval_mode == "sparse"
+    assert Settings(retrieval_mode="hybrid").retrieval_mode == "hybrid"
+    assert Settings(retrieval_dense_limit=0).retrieval_dense_limit == 1
+    assert Settings(retrieval_sparse_limit=0).retrieval_sparse_limit == 1
+    assert Settings(retrieval_rrf_k=0).retrieval_rrf_k == 1
+    with pytest.raises(ValueError, match="retrieval_mode"):
+        Settings(retrieval_mode="keyword")
+
+
+def test_rrf_fusion_combines_dense_and_sparse_hits():
+    store = MilvusChunkStore(embeddings=object())
+    store.settings = Settings(retrieval_rrf_k=60)
+    dense_hits = [
+        {
+            "chunk_id": "a",
+            "content": "semantic match",
+            "score": 0.91,
+            "dense_score": 0.91,
+            "sparse_score": None,
+            "retrieval_sources": ["dense"],
+        },
+        {
+            "chunk_id": "b",
+            "content": "semantic and keyword match",
+            "score": 0.7,
+            "dense_score": 0.7,
+            "sparse_score": None,
+            "retrieval_sources": ["dense"],
+        },
+    ]
+    sparse_hits = [
+        {
+            "chunk_id": "b",
+            "content": "semantic and keyword match",
+            "score": 12.0,
+            "dense_score": None,
+            "sparse_score": 12.0,
+            "retrieval_sources": ["sparse"],
+        },
+        {
+            "chunk_id": "c",
+            "content": "keyword match",
+            "score": 8.0,
+            "dense_score": None,
+            "sparse_score": 8.0,
+            "retrieval_sources": ["sparse"],
+        },
+    ]
+
+    result = store._rrf_fuse(dense_hits, sparse_hits, limit=10)
+
+    assert [item["chunk_id"] for item in result] == ["b", "a", "c"]
+    assert result[0]["dense_score"] == 0.7
+    assert result[0]["sparse_score"] == 12.0
+    assert result[0]["retrieval_sources"] == ["dense", "sparse"]
+    assert result[0]["score"] == pytest.approx((1 / 62) + (1 / 61))
+
+
+def test_hybrid_schema_validation_requires_sparse_bm25_fields():
+    store = MilvusChunkStore(embeddings=object())
+    store.settings = Settings(retrieval_mode="hybrid")
+    legacy_collection = SimpleNamespace(
+        schema=SimpleNamespace(
+            fields=[
+                SimpleNamespace(
+                    name=DENSE_FIELD,
+                    dtype=DataType.FLOAT_VECTOR,
+                    params={"dim": 1024},
+                ),
+                SimpleNamespace(
+                    name=CONTENT_FIELD,
+                    dtype=DataType.VARCHAR,
+                    params={"max_length": 65535, "enable_analyzer": True},
+                ),
+            ],
+            functions=[],
+        )
+    )
+    with pytest.raises(ValueError, match=SPARSE_FIELD):
+        store._validate_collection_schema(legacy_collection)
+
+    hybrid_collection = SimpleNamespace(
+        schema=SimpleNamespace(
+            fields=[
+                SimpleNamespace(
+                    name=DENSE_FIELD,
+                    dtype=DataType.FLOAT_VECTOR,
+                    params={"dim": 1024},
+                ),
+                SimpleNamespace(
+                    name=CONTENT_FIELD,
+                    dtype=DataType.VARCHAR,
+                    params={"max_length": 65535, "enable_analyzer": True},
+                ),
+                SimpleNamespace(
+                    name=SPARSE_FIELD,
+                    dtype=DataType.SPARSE_FLOAT_VECTOR,
+                    params={},
+                ),
+            ],
+            functions=[
+                Function(
+                    name=BM25_FUNCTION,
+                    function_type=FunctionType.BM25,
+                    input_field_names=[CONTENT_FIELD],
+                    output_field_names=[SPARSE_FIELD],
+                )
+            ],
+        )
+    )
+    store._validate_collection_schema(hybrid_collection)
 
 
 def test_web_route_uses_injected_provider_and_returns_web_citation(db_session):

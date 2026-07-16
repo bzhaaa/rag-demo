@@ -36,7 +36,7 @@ class Settings(BaseSettings):
 
     milvus_host: str = "localhost"
     milvus_port: str = "19530"
-    milvus_collection: str = "enterprise_rag_chunks"
+    milvus_collection: str = "enterprise_rag_chunks_hybrid"
 
     llm_api_key: str = ""
     llm_base_url: str = ""
@@ -73,7 +73,11 @@ class Settings(BaseSettings):
     reranker_min_score: float = 0.5
     reranker_top_k: int = 6
     reranker_failure_strategy: str = "reject"
+    retrieval_mode: str = "hybrid"
     retrieval_candidate_count: int = 10
+    retrieval_dense_limit: int = 10
+    retrieval_sparse_limit: int = 10
+    retrieval_rrf_k: int = 60
     retrieval_min_score: Optional[float] = None
     retrieval_max_chunks_per_document: int = 3
     final_context_count: int = 6
@@ -183,6 +187,24 @@ class Settings(BaseSettings):
     @classmethod
     def non_negative_web_search_retries(cls, value: int) -> int:
         return max(0, value)
+
+    @field_validator("retrieval_mode")
+    @classmethod
+    def supported_retrieval_mode(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"dense", "sparse", "hybrid"}:
+            raise ValueError("retrieval_mode must be dense, sparse, or hybrid")
+        return normalized
+
+    @field_validator(
+        "retrieval_candidate_count",
+        "retrieval_dense_limit",
+        "retrieval_sparse_limit",
+        "retrieval_rrf_k",
+    )
+    @classmethod
+    def positive_retrieval_counts(cls, value: int) -> int:
+        return max(1, value)
 
     @field_validator("tavily_search_depth")
     @classmethod

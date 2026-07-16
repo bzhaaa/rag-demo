@@ -122,16 +122,26 @@ class RAGService:
                     self.settings.retrieval_candidate_count,
                 )
             )
+        merged_candidates = merge_candidates(candidates)
         return {
             **state,
-            "candidates": merge_candidates(candidates),
+            "candidates": merged_candidates,
             "diagnostics": {
                 **state.get("diagnostics", {}),
                 "retrieval": {
-                    "candidate_count": len(merge_candidates(candidates)),
-                    "candidates": self._candidate_summaries(
-                        merge_candidates(candidates)
+                    "mode": self.settings.retrieval_mode,
+                    "rrf_k": self.settings.retrieval_rrf_k,
+                    "dense_limit": self.settings.retrieval_dense_limit,
+                    "sparse_limit": self.settings.retrieval_sparse_limit,
+                    "dense_hit_count": self._retrieval_source_count(
+                        merged_candidates, "dense"
                     ),
+                    "sparse_hit_count": self._retrieval_source_count(
+                        merged_candidates, "sparse"
+                    ),
+                    "candidate_count": len(merged_candidates),
+                    "fused_candidate_count": len(merged_candidates),
+                    "candidates": self._candidate_summaries(merged_candidates),
                 },
             },
             "timings": timing_with(
@@ -754,8 +764,21 @@ class RAGService:
             "version_uuid": candidate.get("version_uuid"),
             "source_type": candidate.get("source_type", "knowledge_base"),
             "score": candidate.get("score"),
+            "dense_score": candidate.get("dense_score"),
+            "sparse_score": candidate.get("sparse_score"),
+            "retrieval_sources": candidate.get("retrieval_sources"),
             "rerank_score": candidate.get("rerank_score"),
         }
+
+    @staticmethod
+    def _retrieval_source_count(
+        candidates: Sequence[Dict[str, Any]], source: str
+    ) -> int:
+        return sum(
+            1
+            for candidate in candidates
+            if source in (candidate.get("retrieval_sources") or [])
+        )
 
     @staticmethod
     def _truncate(value: str, limit: int) -> str:

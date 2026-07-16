@@ -7,6 +7,8 @@ from pymilvus import (
     CollectionSchema,
     DataType,
     FieldSchema,
+    Function,
+    FunctionType,
     connections,
     utility,
 )
@@ -20,6 +22,21 @@ def chunk_id(document_uuid: str, version: int, chunk_index: int) -> str:
 
 def _quoted(values: Iterable[str]) -> str:
     return ", ".join(json.dumps(value) for value in values)
+
+
+DENSE_FIELD = "embedding"
+SPARSE_FIELD = "sparse_embedding"
+CONTENT_FIELD = "content"
+BM25_FUNCTION = "content_bm25"
+OUTPUT_FIELDS = [
+    "document_uuid",
+    "version_uuid",
+    "version_number",
+    "page_number",
+    "chunk_index",
+    "source_name",
+    "content",
+]
 
 
 class MilvusChunkStore:
@@ -53,15 +70,7 @@ class MilvusChunkStore:
             name = self.settings.milvus_collection
             if utility.has_collection(name, using=self.alias):
                 collection = Collection(name, using=self.alias)
-                vector_field = next(
-                    field
-                    for field in collection.schema.fields
-                    if field.name == "embedding"
-                )
-                if vector_field.params.get("dim") != self.settings.embedding_dimension:
-                    raise ValueError(
-                        "Milvus embedding dimension does not match EMBEDDING_DIMENSION"
-                    )
+                self._validate_collection_schema(collection)
                 collection.load()
                 self._collection = collection
                 return collection
@@ -76,21 +85,50 @@ class MilvusChunkStore:
                 FieldSchema("page_number", DataType.INT64),
                 FieldSchema("chunk_index", DataType.INT64),
                 FieldSchema("source_name", DataType.VARCHAR, max_length=1024),
-                FieldSchema("content", DataType.VARCHAR, max_length=65535),
                 FieldSchema(
-                    "embedding",
+                    CONTENT_FIELD,
+                    DataType.VARCHAR,
+                    max_length=65535,
+                    enable_analyzer=True,
+                ),
+                FieldSchema(
+                    DENSE_FIELD,
                     DataType.FLOAT_VECTOR,
                     dim=self.settings.embedding_dimension,
                 ),
+                FieldSchema(SPARSE_FIELD, DataType.SPARSE_FLOAT_VECTOR),
             ]
-            schema = CollectionSchema(fields, description="Enterprise RAG chunks")
+            schema = CollectionSchema(
+                fields,
+                description="Enterprise RAG chunks with dense and BM25 sparse retrieval",
+                functions=[
+                    Function(
+                        name=BM25_FUNCTION,
+                        function_type=FunctionType.BM25,
+                        input_field_names=[CONTENT_FIELD],
+                        output_field_names=[SPARSE_FIELD],
+                    )
+                ],
+            )
             collection = Collection(name, schema=schema, using=self.alias)
             collection.create_index(
-                "embedding",
+                DENSE_FIELD,
                 {
                     "metric_type": "COSINE",
                     "index_type": "HNSW",
                     "params": {"M": 16, "efConstruction": 128},
+                },
+            )
+            collection.create_index(
+                SPARSE_FIELD,
+                {
+                    "metric_type": "BM25",
+                    "index_type": "SPARSE_INVERTED_INDEX",
+                    "params": {
+                        "inverted_index_algo": "DAAT_MAXSCORE",
+                        "bm25_k1": 1.2,
+                        "bm25_b": 0.75,
+                    },
                 },
             )
             collection.load()
@@ -99,6 +137,33 @@ class MilvusChunkStore:
         except Exception:
             self._collection = None
             raise
+
+    def _validate_collection_schema(self, collection: Collection) -> None:
+        fields = {field.name: field for field in collection.schema.fields}
+        if DENSE_FIELD not in fields:
+            raise ValueError(f"Milvus collection is missing {DENSE_FIELD} field")
+        vector_field = fields[DENSE_FIELD]
+        if vector_field.params.get("dim") != self.settings.embedding_dimension:
+            raise ValueError("Milvus embedding dimension does not match EMBEDDING_DIMENSION")
+        if self.settings.retrieval_mode == "dense":
+            return
+        if CONTENT_FIELD not in fields:
+            raise ValueError(f"Milvus hybrid collection is missing {CONTENT_FIELD} field")
+        if not fields[CONTENT_FIELD].params.get("enable_analyzer"):
+            raise ValueError("Milvus hybrid collection content field must enable analyzer")
+        if SPARSE_FIELD not in fields:
+            raise ValueError(f"Milvus hybrid collection is missing {SPARSE_FIELD} field")
+        if fields[SPARSE_FIELD].dtype != DataType.SPARSE_FLOAT_VECTOR:
+            raise ValueError("Milvus hybrid collection sparse field has invalid type")
+        functions = getattr(collection.schema, "functions", []) or []
+        has_bm25 = any(
+            getattr(function, "type", None) == FunctionType.BM25
+            and CONTENT_FIELD in list(getattr(function, "input_field_names", []) or [])
+            and SPARSE_FIELD in list(getattr(function, "output_field_names", []) or [])
+            for function in functions
+        )
+        if not has_bm25:
+            raise ValueError("Milvus hybrid collection is missing BM25 function")
 
     def insert_chunks(self, chunks: Sequence[Dict[str, Any]]) -> int:
         if not chunks:
@@ -129,48 +194,128 @@ class MilvusChunkStore:
         if not version_uuids:
             return []
         collection = self.ensure_collection()
-        query_vector = self.embeddings.embed_query(question)
         expression = f"version_uuid in [{_quoted(version_uuids)}]"
+        mode = self.settings.retrieval_mode
+
+        dense_hits: List[Dict[str, Any]] = []
+        sparse_hits: List[Dict[str, Any]] = []
+        if mode in {"dense", "hybrid"}:
+            dense_hits = self._dense_search(collection, question, expression)
+        if mode in {"sparse", "hybrid"}:
+            sparse_hits = self._sparse_search(collection, question, expression)
+        if mode == "dense":
+            return self._single_path_results(dense_hits, "dense", limit)
+        if mode == "sparse":
+            return self._single_path_results(sparse_hits, "sparse", limit)
+        return self._rrf_fuse(dense_hits, sparse_hits, limit)
+
+    def _dense_search(
+        self, collection: Collection, question: str, expression: str
+    ) -> List[Dict[str, Any]]:
+        query_vector = self.embeddings.embed_query(question)
         results = collection.search(
             [query_vector],
-            "embedding",
+            DENSE_FIELD,
             {
                 "metric_type": "COSINE",
-                "params": {"ef": max(32, limit * 4)},
+                "params": {
+                    "ef": max(32, self.settings.retrieval_dense_limit * 4)
+                },
             },
-            limit=limit,
+            limit=self.settings.retrieval_dense_limit,
             expr=expression,
-            output_fields=[
-                "document_uuid",
-                "version_uuid",
-                "version_number",
-                "page_number",
-                "chunk_index",
-                "source_name",
-                "content",
-            ],
+            output_fields=OUTPUT_FIELDS,
         )
-        hits: List[Dict[str, Any]] = []
-        for hit in results[0]:
-            hits.append(
+        return self._hits_to_candidates(results[0], "dense_score")
+
+    def _sparse_search(
+        self, collection: Collection, question: str, expression: str
+    ) -> List[Dict[str, Any]]:
+        results = collection.search(
+            [question],
+            SPARSE_FIELD,
+            {
+                "metric_type": "BM25",
+                "params": {"drop_ratio_search": 0.2},
+            },
+            limit=self.settings.retrieval_sparse_limit,
+            expr=expression,
+            output_fields=OUTPUT_FIELDS,
+        )
+        return self._hits_to_candidates(results[0], "sparse_score")
+
+    @staticmethod
+    def _hits_to_candidates(hits: Sequence[Any], score_field: str) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        for hit in hits:
+            score = float(hit.score)
+            candidates.append(
                 {
-                    "score": float(hit.score),
+                    "score": score,
+                    "dense_score": score if score_field == "dense_score" else None,
+                    "sparse_score": score if score_field == "sparse_score" else None,
+                    "retrieval_sources": [
+                        "dense" if score_field == "dense_score" else "sparse"
+                    ],
                     "chunk_id": hit.id,
-                    **{
-                        field: hit.entity.get(field)
-                        for field in (
-                            "document_uuid",
-                            "version_uuid",
-                            "version_number",
-                            "page_number",
-                            "chunk_index",
-                            "source_name",
-                            "content",
-                        )
-                    },
+                    **{field: hit.entity.get(field) for field in OUTPUT_FIELDS},
                 }
             )
-        return hits
+        return candidates
+
+    @staticmethod
+    def _single_path_results(
+        hits: Sequence[Dict[str, Any]], source: str, limit: int
+    ) -> List[Dict[str, Any]]:
+        score_field = "dense_score" if source == "dense" else "sparse_score"
+        results = []
+        for hit in hits:
+            item = dict(hit)
+            item["score"] = float(item.get(score_field) or 0)
+            item["retrieval_sources"] = [source]
+            results.append(item)
+        return sorted(
+            results,
+            key=lambda item: float(item.get("score") or 0),
+            reverse=True,
+        )[:limit]
+
+    def _rrf_fuse(
+        self,
+        dense_hits: Sequence[Dict[str, Any]],
+        sparse_hits: Sequence[Dict[str, Any]],
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        fused: Dict[str, Dict[str, Any]] = {}
+        for source, hits in (("dense", dense_hits), ("sparse", sparse_hits)):
+            score_field = "dense_score" if source == "dense" else "sparse_score"
+            for rank, hit in enumerate(hits, start=1):
+                chunk_key = str(hit.get("chunk_id") or "")
+                if not chunk_key:
+                    continue
+                item = fused.setdefault(
+                    chunk_key,
+                    {
+                        **hit,
+                        "score": 0.0,
+                        "dense_score": None,
+                        "sparse_score": None,
+                        "retrieval_sources": [],
+                    },
+                )
+                item["score"] += 1 / (self.settings.retrieval_rrf_k + rank)
+                item[score_field] = hit.get(score_field)
+                if source not in item["retrieval_sources"]:
+                    item["retrieval_sources"].append(source)
+        return sorted(
+            fused.values(),
+            key=lambda item: (
+                float(item.get("score") or 0),
+                float(item.get("dense_score") or 0),
+                float(item.get("sparse_score") or 0),
+            ),
+            reverse=True,
+        )[:limit]
 
     def delete_version(self, version_uuid: str) -> None:
         collection = self.ensure_collection()
@@ -192,7 +337,7 @@ class MilvusChunkStore:
             "chunk_index",
             "source_name",
             "content",
-            "embedding",
+            DENSE_FIELD,
         ]
         iterator = collection.query_iterator(
             batch_size=500,
