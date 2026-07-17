@@ -8,10 +8,12 @@ from sqlalchemy import text
 from app.api import router
 from app.config import get_settings
 from app.db import SessionLocal
+from app.rag.orchestration.factory import RAGPipelineFactory
 from app.storage import ObjectStorage
 from app.vector_store import MilvusChunkStore
 
 settings = get_settings()
+RAGPipelineFactory(settings).validate_module_configuration()
 
 
 @asynccontextmanager
@@ -56,7 +58,14 @@ def ready(response: Response) -> dict:
         try:
             dependencies[name] = "ok" if check() else "unavailable"
         except Exception as exc:
-            dependencies[name] = f"unavailable: {type(exc).__name__}"
+            detail = (
+                f": {str(exc)[:240]}"
+                if name == "milvus" and str(exc)
+                else ""
+            )
+            dependencies[name] = (
+                f"unavailable: {type(exc).__name__}{detail}"
+            )
     status = (
         "ok"
         if all(value == "ok" for value in dependencies.values())

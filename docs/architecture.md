@@ -2,14 +2,14 @@
 
 The application is split into six runtime services:
 
-- FastAPI owns public APIs, authentication, authorization, audit writes, and RAG orchestration.
+- FastAPI owns public APIs, authentication, authorization, audit writes, and the RAG application service.
 - Streamlit is an API-only pilot client and never connects to MySQL, MinIO, Milvus, or model endpoints.
 - Celery workers parse, chunk, embed, index, activate, and clean up document versions.
 - MySQL 8.0 is the source of truth for users, departments, ACLs, versions, jobs, conversations, and audits.
 - MinIO stores original uploads.
 - Milvus stores chunk text, embeddings, and retrieval metadata. It does not decide authorization.
 
-Retrieval first resolves the current user's accessible active versions from MySQL. Only those version UUIDs are included in the Milvus filter. Relevance grading remains parallel, with configurable concurrency, and generation refuses when authorized evidence is insufficient.
+Retrieval first resolves the current user's accessible active versions from MySQL. Only those version UUIDs are included in the Milvus filter. The query path is a fixed LangGraph pipeline composed from whitelist modules for query rewriting, retrieval, fusion, reranking, routing, web search, selection, generation, and citation validation. The pipeline does not access SQLAlchemy. LLM relevance grading is only used by the configured reranker failure fallback.
 
 RAG 的检索、索引、评分、生成、引用和测试覆盖梳理见 [RAG](rag.md)。
 

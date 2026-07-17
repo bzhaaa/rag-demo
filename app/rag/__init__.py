@@ -1,4 +1,6 @@
+from app.rag.contracts.models import Candidate
 from app.rag.model_gateway import LangChainRAGModelGateway, create_chat_model
+from app.rag.orchestration.pipeline import RAGPipeline
 from app.rag.preprocessors import DefaultQueryPreprocessor, create_query_preprocessor
 from app.rag.rerankers import (
     DefaultCandidateReranker,
@@ -27,6 +29,7 @@ from app.rag.web_search import (
 
 __all__ = [
     "CandidateReranker",
+    "Candidate",
     "DefaultCandidateReranker",
     "DefaultQueryPreprocessor",
     "DisabledWebSearchProvider",
@@ -36,6 +39,7 @@ __all__ = [
     "MockWebSearchProvider",
     "QueryPreprocessor",
     "RAGModelGateway",
+    "RAGPipeline",
     "RAGService",
     "RAGState",
     "RerankerError",

@@ -1,7 +1,7 @@
 import math
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-import requests
+import requests  # type: ignore[import-untyped,unused-ignore]
 
 from app.config import Settings
 from app.rag.types import CandidateReranker
@@ -134,6 +134,8 @@ class ExternalCandidateReranker:
             if index < 0 or index >= candidate_count:
                 raise ValueError("reranker index out of range")
             raw_score = item.get("relevance_score", item.get("score", 0))
+            if raw_score is None:
+                raise ValueError("relevance_score must be numeric")
             score = float(raw_score)
             if not math.isfinite(score) or score < 0 or score > 1:
                 raise ValueError("relevance_score must be between 0 and 1")

@@ -36,7 +36,7 @@ class Settings(BaseSettings):
 
     milvus_host: str = "localhost"
     milvus_port: str = "19530"
-    milvus_collection: str = "enterprise_rag_chunks_hybrid"
+    milvus_collection: str = "enterprise_rag_chunks_parent_child_v2"
 
     llm_api_key: str = ""
     llm_base_url: str = ""
@@ -83,12 +83,25 @@ class Settings(BaseSettings):
     final_context_count: int = 6
     max_upload_bytes: int = 25 * 1024 * 1024
     max_pdf_pages: int = 500
+    chunking_strategy: str = "structure_parent_child"
     chunk_size: int = 800
     chunk_overlap: int = 120
+    chunk_parent_size: int = 2400
+    chunk_parent_overlap: int = 200
+    chunk_min_size: int = 120
+    chunk_context_header_enabled: bool = True
+    chunking_version: str = "v2"
     model_timeout_seconds: int = 45
     model_max_retries: int = 2
     rag_citation_retry_count: int = 1
     rag_min_relevant_documents: int = 1
+    rag_query_module: str = "default"
+    rag_retriever_module: str = "milvus"
+    rag_fusion_module: str = "rrf"
+    rag_router_module: str = "llm"
+    rag_selector_module: str = "route_aware"
+    rag_generator_module: str = "langchain"
+    rag_validator_module: str = "bracket_citations"
     streamlit_api_url: str = "http://localhost:8000"
 
     langsmith_tracing: bool = False
@@ -196,6 +209,47 @@ class Settings(BaseSettings):
             raise ValueError("retrieval_mode must be dense, sparse, or hybrid")
         return normalized
 
+    @field_validator("chunking_strategy")
+    @classmethod
+    def supported_chunking_strategy(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"structure_parent_child", "legacy_recursive"}:
+            raise ValueError(
+                "chunking_strategy must be structure_parent_child or "
+                "legacy_recursive"
+            )
+        return normalized
+
+    @field_validator(
+        "chunk_size",
+        "chunk_parent_size",
+        "chunk_min_size",
+    )
+    @classmethod
+    def positive_chunk_sizes(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("chunk sizes must be positive")
+        return value
+
+    @field_validator("chunk_overlap", "chunk_parent_overlap")
+    @classmethod
+    def non_negative_chunk_overlaps(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("chunk overlaps must be non-negative")
+        return value
+
+    @model_validator(mode="after")
+    def validate_chunking_sizes(self):
+        if self.chunk_overlap >= self.chunk_size:
+            raise ValueError("chunk_overlap must be smaller than chunk_size")
+        if self.chunk_parent_overlap >= self.chunk_parent_size:
+            raise ValueError(
+                "chunk_parent_overlap must be smaller than chunk_parent_size"
+            )
+        if self.chunk_min_size > self.chunk_size:
+            raise ValueError("chunk_min_size must not exceed chunk_size")
+        return self
+
     @field_validator(
         "retrieval_candidate_count",
         "retrieval_dense_limit",
@@ -252,6 +306,22 @@ class Settings(BaseSettings):
             if rewrite_type not in normalized:
                 normalized.append(rewrite_type)
         return normalized or ["normalize"]
+
+    @field_validator(
+        "rag_query_module",
+        "rag_retriever_module",
+        "rag_fusion_module",
+        "rag_router_module",
+        "rag_selector_module",
+        "rag_generator_module",
+        "rag_validator_module",
+    )
+    @classmethod
+    def normalize_rag_module_name(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if not normalized:
+            raise ValueError("RAG module name must not be empty")
+        return normalized
 
     def configure_langsmith(self) -> None:
         os.environ["LANGCHAIN_TRACING_V2"] = (

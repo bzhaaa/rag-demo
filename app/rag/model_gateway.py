@@ -1,6 +1,6 @@
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Sequence, Type, TypeVar, Union
+from typing import Any, Dict, List, Literal, Sequence, Type, TypeVar
 
 from langchain_core.output_parsers import PydanticOutputParser, StrOutputParser
 from langchain_core.prompts import PromptTemplate
@@ -115,7 +115,7 @@ class LangChainRAGModelGateway:
         question: str,
         candidates: Sequence[Dict[str, Any]],
         max_concurrency: int,
-    ) -> List[Union[bool, Exception]]:
+    ) -> List[Any]:
         parser = PydanticOutputParser(pydantic_object=RelevanceGrade)
         prompt = PromptTemplate(
             template=(
@@ -150,7 +150,7 @@ class LangChainRAGModelGateway:
                 return_exceptions=True,
             )
 
-        results: List[Union[bool, Exception]] = []
+        results: List[Any] = []
         for response in responses:
             if isinstance(response, Exception):
                 results.append(response)

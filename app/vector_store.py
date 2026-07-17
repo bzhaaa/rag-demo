@@ -20,6 +20,10 @@ def chunk_id(document_uuid: str, version: int, chunk_index: int) -> str:
     return f"{document_uuid}:{version}:{chunk_index}"
 
 
+def parent_chunk_id(document_uuid: str, version: int, parent_index: int) -> str:
+    return f"{document_uuid}:{version}:parent:{parent_index}"
+
+
 def _quoted(values: Iterable[str]) -> str:
     return ", ".join(json.dumps(value) for value in values)
 
@@ -33,10 +37,30 @@ OUTPUT_FIELDS = [
     "version_uuid",
     "version_number",
     "page_number",
+    "page_start",
+    "page_end",
     "chunk_index",
+    "parent_chunk_id",
+    "parent_content",
+    "parent_index",
+    "section_title",
+    "section_path",
+    "chunking_strategy",
+    "chunking_version",
     "source_name",
     "content",
 ]
+PARENT_CHILD_FIELDS = {
+    "parent_chunk_id",
+    "parent_content",
+    "parent_index",
+    "section_title",
+    "section_path",
+    "page_start",
+    "page_end",
+    "chunking_strategy",
+    "chunking_version",
+}
 
 
 class MilvusChunkStore:
@@ -83,7 +107,16 @@ class MilvusChunkStore:
                 FieldSchema("department_uuid", DataType.VARCHAR, max_length=36),
                 FieldSchema("visibility", DataType.VARCHAR, max_length=20),
                 FieldSchema("page_number", DataType.INT64),
+                FieldSchema("page_start", DataType.INT64),
+                FieldSchema("page_end", DataType.INT64),
                 FieldSchema("chunk_index", DataType.INT64),
+                FieldSchema("parent_chunk_id", DataType.VARCHAR, max_length=512),
+                FieldSchema("parent_content", DataType.VARCHAR, max_length=65535),
+                FieldSchema("parent_index", DataType.INT64),
+                FieldSchema("section_title", DataType.VARCHAR, max_length=2048),
+                FieldSchema("section_path", DataType.VARCHAR, max_length=4096),
+                FieldSchema("chunking_strategy", DataType.VARCHAR, max_length=64),
+                FieldSchema("chunking_version", DataType.VARCHAR, max_length=64),
                 FieldSchema("source_name", DataType.VARCHAR, max_length=1024),
                 FieldSchema(
                     CONTENT_FIELD,
@@ -140,6 +173,12 @@ class MilvusChunkStore:
 
     def _validate_collection_schema(self, collection: Collection) -> None:
         fields = {field.name: field for field in collection.schema.fields}
+        missing_parent_child_fields = sorted(PARENT_CHILD_FIELDS - fields.keys())
+        if missing_parent_child_fields:
+            raise ValueError(
+                "Milvus parent-child collection is missing fields: "
+                + ", ".join(missing_parent_child_fields)
+            )
         if DENSE_FIELD not in fields:
             raise ValueError(f"Milvus collection is missing {DENSE_FIELD} field")
         vector_field = fields[DENSE_FIELD]
@@ -179,7 +218,16 @@ class MilvusChunkStore:
             [chunk["department_uuid"] for chunk in chunks],
             [chunk["visibility"] for chunk in chunks],
             [chunk.get("page_number") or 0 for chunk in chunks],
+            [chunk.get("page_start") or 0 for chunk in chunks],
+            [chunk.get("page_end") or 0 for chunk in chunks],
             [chunk["chunk_index"] for chunk in chunks],
+            [chunk["parent_chunk_id"] for chunk in chunks],
+            [chunk["parent_content"][:65535] for chunk in chunks],
+            [chunk["parent_index"] for chunk in chunks],
+            [str(chunk.get("section_title") or "")[:2048] for chunk in chunks],
+            [str(chunk.get("section_path") or "")[:4096] for chunk in chunks],
+            [chunk["chunking_strategy"][:64] for chunk in chunks],
+            [chunk["chunking_version"][:64] for chunk in chunks],
             [chunk["source_name"][:1024] for chunk in chunks],
             [chunk["content"][:65535] for chunk in chunks],
             vectors,
@@ -193,25 +241,54 @@ class MilvusChunkStore:
     ) -> List[Dict[str, Any]]:
         if not version_uuids:
             return []
-        collection = self.ensure_collection()
-        expression = f"version_uuid in [{_quoted(version_uuids)}]"
         mode = self.settings.retrieval_mode
 
         dense_hits: List[Dict[str, Any]] = []
         sparse_hits: List[Dict[str, Any]] = []
         if mode in {"dense", "hybrid"}:
-            dense_hits = self._dense_search(collection, question, expression)
+            dense_hits = self.search_dense(
+                question,
+                version_uuids,
+                self.settings.retrieval_dense_limit,
+            )
         if mode in {"sparse", "hybrid"}:
-            sparse_hits = self._sparse_search(collection, question, expression)
+            sparse_hits = self.search_sparse(
+                question,
+                version_uuids,
+                self.settings.retrieval_sparse_limit,
+            )
         if mode == "dense":
             return self._single_path_results(dense_hits, "dense", limit)
         if mode == "sparse":
             return self._single_path_results(sparse_hits, "sparse", limit)
         return self._rrf_fuse(dense_hits, sparse_hits, limit)
 
-    def _dense_search(
-        self, collection: Collection, question: str, expression: str
+    def search_dense(
+        self, question: str, version_uuids: Sequence[str], limit: int
     ) -> List[Dict[str, Any]]:
+        if not version_uuids:
+            return []
+        collection = self.ensure_collection()
+        expression = f"version_uuid in [{_quoted(version_uuids)}]"
+        return self._dense_search(collection, question, expression, limit)
+
+    def search_sparse(
+        self, question: str, version_uuids: Sequence[str], limit: int
+    ) -> List[Dict[str, Any]]:
+        if not version_uuids:
+            return []
+        collection = self.ensure_collection()
+        expression = f"version_uuid in [{_quoted(version_uuids)}]"
+        return self._sparse_search(collection, question, expression, limit)
+
+    def _dense_search(
+        self,
+        collection: Collection,
+        question: str,
+        expression: str,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        search_limit = limit or self.settings.retrieval_dense_limit
         query_vector = self.embeddings.embed_query(question)
         results = collection.search(
             [query_vector],
@@ -219,18 +296,23 @@ class MilvusChunkStore:
             {
                 "metric_type": "COSINE",
                 "params": {
-                    "ef": max(32, self.settings.retrieval_dense_limit * 4)
+                    "ef": max(32, search_limit * 4)
                 },
             },
-            limit=self.settings.retrieval_dense_limit,
+            limit=search_limit,
             expr=expression,
             output_fields=OUTPUT_FIELDS,
         )
         return self._hits_to_candidates(results[0], "dense_score")
 
     def _sparse_search(
-        self, collection: Collection, question: str, expression: str
+        self,
+        collection: Collection,
+        question: str,
+        expression: str,
+        limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
+        search_limit = limit or self.settings.retrieval_sparse_limit
         results = collection.search(
             [question],
             SPARSE_FIELD,
@@ -238,7 +320,7 @@ class MilvusChunkStore:
                 "metric_type": "BM25",
                 "params": {"drop_ratio_search": 0.2},
             },
-            limit=self.settings.retrieval_sparse_limit,
+            limit=search_limit,
             expr=expression,
             output_fields=OUTPUT_FIELDS,
         )
@@ -334,7 +416,16 @@ class MilvusChunkStore:
             "department_uuid",
             "visibility",
             "page_number",
+            "page_start",
+            "page_end",
             "chunk_index",
+            "parent_chunk_id",
+            "parent_content",
+            "parent_index",
+            "section_title",
+            "section_path",
+            "chunking_strategy",
+            "chunking_version",
             "source_name",
             "content",
             DENSE_FIELD,

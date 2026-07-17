@@ -3,7 +3,7 @@ import math
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-import requests
+import requests  # type: ignore[import-untyped,unused-ignore]
 
 from app.config import Settings
 from app.rag.types import WebSearchProvider, WebSearchResponse

@@ -26,6 +26,7 @@ from app.vector_store import (
     BM25_FUNCTION,
     CONTENT_FIELD,
     DENSE_FIELD,
+    PARENT_CHILD_FIELDS,
     SPARSE_FIELD,
     MilvusChunkStore,
 )
@@ -238,6 +239,31 @@ def make_chunk(document, version, index: int, content: str, score: float = 0.9):
     }
 
 
+def make_parent_child_chunk(
+    document,
+    version,
+    index: int,
+    child_content: str,
+    parent_content: str,
+    parent_index: int,
+    score: float = 0.9,
+):
+    return {
+        **make_chunk(document, version, index, child_content, score),
+        "parent_chunk_id": (
+            f"{document.uuid}:{version.version_number}:parent:{parent_index}"
+        ),
+        "parent_content": parent_content,
+        "parent_index": parent_index,
+        "section_title": "审批流程",
+        "section_path": "员工制度 > 请假管理 > 审批流程",
+        "page_start": index + 1,
+        "page_end": index + 2,
+        "chunking_strategy": "structure_parent_child",
+        "chunking_version": "v2",
+    }
+
+
 def test_answer_uses_authorized_versions_and_persists_complete_metrics(db_session):
     db, models = db_session
     user, document, version = create_rag_user_and_document(db, models)
@@ -265,6 +291,98 @@ def test_answer_uses_authorized_versions_and_persists_complete_metrics(db_sessio
     assert diagnostics["retrieval"]["candidate_count"] == 1
     assert diagnostics["reranking"]["knowledge"]["relevant_count"] == 1
     assert diagnostics["selected_evidence_count"] == 1
+
+
+def test_parent_child_selection_dedupes_parent_and_cites_matched_child(
+    db_session,
+):
+    db, models = db_session
+    user, document, version = create_rag_user_and_document(db, models)
+    parent_content = "审批流程完整上下文：员工申请后由主管审批，再由人事备案。"
+    first = make_parent_child_chunk(
+        document,
+        version,
+        0,
+        "主管审批。",
+        parent_content,
+        0,
+        score=0.8,
+    )
+    second = make_parent_child_chunk(
+        document,
+        version,
+        1,
+        "人事备案。",
+        parent_content,
+        0,
+        score=0.7,
+    )
+    vector_store = FakeVectorStore({"请假如何审批？": [first, second]})
+    gateway = FakeModelGateway(["请假需要主管审批并由人事备案。[1]"])
+    reranker = FakeScoredReranker([0.72, 0.93])
+    service = RAGService(
+        vector_store=vector_store,
+        model_gateway=gateway,
+        reranker=reranker,
+        settings=Settings(
+            web_search_enabled=False,
+            final_context_count=6,
+        ),
+    )
+
+    result = service.answer(db, user, "请假如何审批？")
+
+    assert result["citations"][0]["chunk_id"] == second["chunk_id"]
+    assert result["citations"][0]["excerpt"] == "人事备案。"
+    message = list(db.scalars(select(Message).order_by(Message.id)))[-1]
+    diagnostics = message.metrics["rag_diagnostics"]["parent_expansion"]
+    assert diagnostics["knowledge_before_dedup"] == 2
+    assert diagnostics["knowledge_after_dedup"] == 1
+    assert diagnostics["strategy"] == "structure_parent_child"
+    assert diagnostics["version"] == "v2"
+    assert diagnostics["evidence"][0]["matched_child_id"] == second["chunk_id"]
+    assert diagnostics["evidence"][0]["parent_chunk_id"] == (
+        second["parent_chunk_id"]
+    )
+
+
+def test_parent_child_generation_receives_parent_content(db_session):
+    db, models = db_session
+    user, document, version = create_rag_user_and_document(db, models)
+    chunk = make_parent_child_chunk(
+        document,
+        version,
+        0,
+        "实际命中的 Child。",
+        "用于生成答案的完整 Parent 上下文。",
+        0,
+    )
+
+    class InspectingGateway(FakeModelGateway):
+        def generate_answer(
+            self,
+            question: str,
+            evidence: Sequence[Dict[str, Any]],
+            strict_citations: bool = False,
+        ) -> str:
+            assert evidence[0]["content"] == "用于生成答案的完整 Parent 上下文。"
+            assert evidence[0]["citation_content"] == "实际命中的 Child。"
+            return super().generate_answer(
+                question,
+                evidence,
+                strict_citations,
+            )
+
+    service = RAGService(
+        vector_store=FakeVectorStore({"Parent？": [chunk]}),
+        model_gateway=InspectingGateway(["答案。[1]"]),
+        reranker=PassThroughReranker(),
+        settings=Settings(web_search_enabled=False),
+    )
+
+    result = service.answer(db, user, "Parent？")
+
+    assert result["citations"][0]["excerpt"] == "实际命中的 Child。"
 
 
 def test_retrieval_diagnostics_include_hybrid_scores(db_session):
@@ -381,11 +499,38 @@ def test_hybrid_schema_validation_requires_sparse_bm25_fields():
         )
     )
     with pytest.raises(ValueError, match=SPARSE_FIELD):
+        parent_child_collection = SimpleNamespace(
+            schema=SimpleNamespace(
+                fields=[
+                    *legacy_collection.schema.fields,
+                    *[
+                        SimpleNamespace(
+                            name=name,
+                            dtype=DataType.VARCHAR,
+                            params={},
+                        )
+                        for name in PARENT_CHILD_FIELDS
+                    ],
+                ],
+                functions=[],
+            )
+        )
+        store._validate_collection_schema(parent_child_collection)
+
+    with pytest.raises(ValueError, match="parent-child"):
         store._validate_collection_schema(legacy_collection)
 
     hybrid_collection = SimpleNamespace(
         schema=SimpleNamespace(
             fields=[
+                *[
+                    SimpleNamespace(
+                        name=name,
+                        dtype=DataType.VARCHAR,
+                        params={},
+                    )
+                    for name in PARENT_CHILD_FIELDS
+                ],
                 SimpleNamespace(
                     name=DENSE_FIELD,
                     dtype=DataType.FLOAT_VECTOR,

@@ -10,7 +10,9 @@
 - MySQL 8.0：用户、部门、文档、ACL、版本、任务、会话和审计的唯一事实来源。
 - MinIO：保存 PDF、TXT 和 Markdown 原始文件。
 - Milvus：保存 chunk、Embedding 和检索元数据，查询前由后端生成授权版本过滤条件。
-- LangGraph：并行相关性评分、证据判断和答案生成。
+- LangGraph：以固定拓扑编排查询改写、检索、融合、重排、路由、证据选择、生成和引用校验。
+
+查询链路采用 Modular RAG 结构。`RAGService` 只负责授权、会话、持久化和审计，SQLAlchemy 不进入 `RAGPipeline`；各查询阶段通过白名单 Registry 组装，可以在不改变 HTTP API 和 diagnostics 合约的前提下替换实现。
 
 授权知识不足时可通过 Tavily Search API 获取真实外部候选，候选必须经过专业 Reranker 后才能用于答案生成。Tavily 故障时返回结构化拒答，不使用 Mock 或未经验证的替代内容。
 
@@ -45,21 +47,53 @@ LANGSMITH_HIDE_INPUTS=true
 LANGSMITH_HIDE_OUTPUTS=true
 ```
 
-Hybrid retrieval uses Milvus dense vector search plus native BM25 sparse search by default:
+文档默认采用结构感知 Parent-Child 切分，Child 用于 Dense、BM25 和
+Reranker，Parent 用于最终答案生成：
 
 ```dotenv
-MILVUS_COLLECTION=enterprise_rag_chunks_hybrid
+CHUNKING_STRATEGY=structure_parent_child
+CHUNK_SIZE=800
+CHUNK_OVERLAP=120
+CHUNK_PARENT_SIZE=2400
+CHUNK_PARENT_OVERLAP=200
+CHUNK_MIN_SIZE=120
+CHUNK_CONTEXT_HEADER_ENABLED=true
+CHUNKING_VERSION=v2
+MILVUS_COLLECTION=enterprise_rag_chunks_parent_child_v2
 RETRIEVAL_MODE=hybrid
 RETRIEVAL_DENSE_LIMIT=10
 RETRIEVAL_SPARSE_LIMIT=10
 RETRIEVAL_RRF_K=60
 ```
 
-After changing from the old dense-only collection, rebuild active ready document versions into the new hybrid collection:
+Milvus 默认使用 Dense 向量检索和原生 BM25 Sparse 检索，并通过 RRF
+融合。Markdown 会保留标题层级、代码块、列表和简单表格；TXT 与文本型
+PDF 会识别常见章节、条款和编号结构。扫描件和复杂表格暂不支持。
+
+Modular RAG 默认模块：
+
+```dotenv
+RAG_QUERY_MODULE=default
+RAG_RETRIEVER_MODULE=milvus
+RAG_FUSION_MODULE=rrf
+RAG_ROUTER_MODULE=llm
+RAG_SELECTOR_MODULE=route_aware
+RAG_GENERATOR_MODULE=langchain
+RAG_VALIDATOR_MODULE=bracket_citations
+```
+
+模块名只能从内置 Registry 白名单选择，配置未知名称时应用组装会立即失败，不执行任意动态导入。
+
+从旧 collection 切换到 Parent-Child collection 后，重建所有 active ready
+版本。脚本会先按 `version_uuid` 删除新 collection 中的旧结果，支持幂等重建：
 
 ```powershell
+.\.venv\Scripts\python.exe scripts\rebuild_hybrid_index.py --dry-run
 .\.venv\Scripts\python.exe scripts\rebuild_hybrid_index.py
 ```
+
+切换期间应暂停上传 Worker，同时切换 API 和 Worker 的
+`MILVUS_COLLECTION`，并在一个观察周期内保留旧 collection 便于回滚。
 
 2. 确保本机 Milvus 可通过 `localhost:19530` 访问，然后启动应用：
 
@@ -124,4 +158,4 @@ Windows 本地 Celery 建议使用 `--pool=solo`；容器中使用默认 prefork
 docker compose config
 ```
 
-详细设计见 [架构](docs/architecture.md)、[API](docs/api.md)、[数据模型](docs/data-model.md) 和 [测试计划](docs/test-plan.md)。
+详细设计见 [架构](docs/architecture.md)、[RAG](docs/rag.md)、[超参数](docs/hyperparameters.md)、[API](docs/api.md)、[数据模型](docs/data-model.md) 和 [测试计划](docs/test-plan.md)。

@@ -18,16 +18,23 @@ RAG 子系统包含：
 
 ## 主要文件
 
-- `app/rag/service.py`：`RAGService` 和 LangGraph 主链路，负责编排查询预处理、检索、Reranker、Web Search、证据选择、生成、引用和持久化。
-- `app/rag/rerankers.py`：候选重排实现，包括本地默认策略、透传策略和外部 HTTP Reranker。
-- `app/rag/model_gateway.py`：LLM 调用入口，负责查询改写、证据路由、答案生成，以及故障回退时的 LLM 相关性评分。
-- `app/rag/preprocessors.py`：查询预处理策略组合。
-- `app/rag/web_search.py`：Tavily HTTP provider、重试策略和 Web 结果标准化。
-- `app/rag/types.py`：RAG 状态和组件协议。
-- `app/rag/utils.py`：查询规范化、候选合并、引用解析、耗时记录等工具。
+- `app/rag/application/service.py`：应用层服务，负责授权版本解析、会话、消息持久化和审计。
+- `app/rag/application/citations.py`：根据 DB 文档信息组装知识库和 Web 引用。
+- `app/rag/contracts/`：`Candidate`、阶段结果数据类、能力协议和 LangGraph `RAGState`。
+- `app/rag/modules/`：查询、检索、RRF 融合、Reranker、路由、Web Search、证据选择、生成和引用校验模块。
+- `app/rag/orchestration/pipeline.py`：固定 LangGraph 拓扑，只处理结构化状态，不访问 SQLAlchemy。
+- `app/rag/orchestration/registry.py`：内置模块白名单，不支持任意动态 import。
+- `app/rag/orchestration/factory.py`：根据 Settings 和注入的 Provider 组装 Pipeline。
+- `app/rag/providers/`：百炼兼容 LLM、Milvus、HTTP Reranker 和 Tavily 的 Provider/Adapter。
+- `app/rag/compatibility/`：旧统一 Gateway 等注入方式的兼容适配。
+- `app/rag/service.py`：保留旧导入路径和构造参数的兼容门面。
+- `app/rag/types.py`：旧协议导出兼容层。
+- `app/rag/rerankers.py`、`app/rag/model_gateway.py`、`app/rag/preprocessors.py`、`app/rag/web_search.py`：保留现有实现和旧导入路径。
+- `app/rag/utils.py`：查询规范化、引用解析和耗时记录等工具。
 - `app/vector_store.py`：Milvus collection、Embedding、授权过滤检索、向量写入和清理。
 - `app/repositories.py`：根据当前用户解析可访问的活跃文档版本。
-- `app/ingestion.py`：抽取文档文本并构建 chunk 元数据。
+- `app/chunking/`：统一解析契约、结构感知解析器、Parent-Child 与旧版递归切分策略。
+- `app/ingestion.py`：保留兼容入口，将解析和切分委托给 `app/chunking/`，并构建 Milvus 元数据。
 - `app/tasks.py`：Celery 文档入库和向量清理任务。
 - `app/api.py`：上传、文档、任务、会话和问答 API。
 - `app/config.py`：RAG、模型、Reranker、Web Search 和 LangSmith 配置。
@@ -42,25 +49,28 @@ flowchart LR
     Persist --> MinIO["原始文件写入 MinIO"]
     Persist --> Queue["投递 Celery ingest_document"]
     Queue --> Parse["解析文档"]
-    Parse --> Chunk["切分 Chunk"]
-    Chunk --> Embed["Embedding"]
+    Parse --> Blocks["识别标题、条款、段落和结构块"]
+    Blocks --> Parent["构建 Parent Section"]
+    Parent --> Child["切分 Child Chunk"]
+    Child --> Embed["Child Embedding"]
     Embed --> Milvus["写入 Milvus"]
     Milvus --> Activate["激活版本"]
 
     Query["POST /api/v1/queries"] --> Versions["解析用户可访问版本"]
-    Versions --> Preprocess["查询预处理"]
-    Preprocess --> Search["Milvus 授权召回"]
-    Search --> Rerank["HTTP Reranker 准入"]
-    Rerank --> WebEnabled{"启用 Web Search?"}
-    WebEnabled -->|否| SelectKB["选择知识库证据或拒答"]
-    WebEnabled -->|是| Route["LLM 证据路由"]
-    Route -->|knowledge_base| SelectKB
+    Versions --> Preprocess["Query Module"]
+    Preprocess --> Search["Retrieve Module"]
+    Search --> Fuse["Fusion Module"]
+    Fuse --> Rerank["Rerank Module"]
+    Rerank --> Expand["Parent 去重与扩展"]
+    Expand --> Route["Route Module"]
+    Route -->|knowledge_base| SelectKB["Select Module"]
     Route -->|web / hybrid| WebSearch["Tavily Web Search"]
-    WebSearch --> WebRerank["Web 结果同样经过 Reranker"]
-    WebRerank --> Select["按路由选择最终证据"]
-    SelectKB --> Generate["答案生成与引用校验"]
+    WebSearch --> WebRerank["Web Rerank Module"]
+    WebRerank --> Select["Select Module"]
+    SelectKB --> Generate["Generate Module"]
     Select --> Generate
-    Generate --> Save["保存消息、引用、指标和审计"]
+    Generate --> ValidateCitation["Validate Module"]
+    ValidateCitation --> Save["保存消息、引用、指标和审计"]
     Save --> Response["QueryResponse"]
 ```
 
@@ -69,27 +79,60 @@ flowchart LR
 1. 上传接口读取文件，校验归属和部门边界，创建文档版本与入库任务。
 2. 原始文件写入 MinIO，业务元数据写入 MySQL。
 3. Celery Worker 执行 `ingest_document`，依次进入 `parsing`、`embedding`、`indexing`、`activating`、`ready` 阶段。
-4. `parse_document` 支持 PDF、TXT 和 Markdown。
-5. `build_chunks` 使用 `RecursiveCharacterTextSplitter`，切分参数来自 `CHUNK_SIZE` 和 `CHUNK_OVERLAP`。
-6. Chunk ID 使用确定性格式：`document_uuid:version_number:chunk_index`。
-7. `MilvusChunkStore.insert_chunks` 对 chunk 文本做 Embedding，并写入向量和检索元数据。
-8. 只有 Milvus 写入成功后才激活新版本；失败时旧版本继续可检索。
+4. `StructureAwareDocumentParser` 支持文本型 PDF、TXT 和 Markdown。Markdown 保留 H1-H6 路径、代码块、列表和简单表格；TXT/PDF 识别常见章节、条款和多级编号。
+5. PDF 解析会移除多页重复页眉页脚；仅在上一页没有结束标点、下一页也不是标题或列表时拼接跨页段落。扫描件和复杂表格本期不处理。
+6. `ParentChildChunkingStrategy` 先按章节或条款构建 Parent，再在 Parent 内生成 Child。Child 默认 `800/120`，Parent 默认 `2400/200`。
+7. 标题路径作为 Child 检索前缀。代码块、列表和简单表格未超过上限时保持完整，小于 `CHUNK_MIN_SIZE` 的碎片只在同一标题层级内合并。
+8. Child ID 使用 `document_uuid:version_number:chunk_index`；Parent ID 使用 `document_uuid:version_number:parent:parent_index`。
+9. Milvus 只对 Child 建立 Dense 与 BM25 Sparse 索引。每个 Child 同时保存 `parent_content`、标题路径、页码范围和切分版本。
+10. 文档版本的 MySQL `metadata` 保存切分策略与参数。只有 Milvus 写入成功后才激活新版本；失败时旧版本继续可检索。
 
 ## 查询与生成路径
 
 1. `POST /api/v1/queries` 只接收 `question` 和可选 `conversation_uuid`。客户端不能传部门 ID、文档 ID 或 Milvus 过滤表达式。
 2. `RAGService.answer` 通过 `active_versions_for_user` 获取当前用户可访问的活跃版本 UUID。MySQL 是授权事实来源。
-3. `preprocess_query` 生成检索查询列表。用户原始问题保持不变，用于最终答案生成。
+3. `preprocess` 模块生成检索查询列表。用户原始问题保持不变，用于最终答案生成。
 4. `retrieve` 对预处理后的查询逐个执行 Milvus 检索，并应用 `version_uuid in [...]` 授权过滤。
-5. 多查询召回结果按 `chunk_id` 合并，同一个 chunk 保留最高向量分数。
-6. `grade_documents` 节点现在实际执行的是 Reranker 准入：外部 Reranker 打分、阈值过滤、Top-K 截断。
-7. Web Search 关闭时，知识库证据达到 `RAG_MIN_RELEVANT_DOCUMENTS` 后直接生成，否则返回结构化拒答。
-8. Web Search 开启时，`route_evidence` 让 LLM 在 `knowledge_base`、`web`、`hybrid` 中选择证据路线。
-9. `web` 和 `hybrid` 路由调用 Tavily。默认只使用规范化原问题搜索一次，以控制费用和延迟。
-10. Web 候选与知识库候选使用同一套 Reranker 准入规则。
-11. `generate` 根据最终证据生成答案，并校验答案中的 `[n]` 引用。
-12. 无引用、引用越界或重试后仍无有效引用时，返回 `invalid_citations` 拒答。
-13. 查询完成后保存用户消息、助手消息、引用、耗时指标、RAG diagnostics 和审计日志。
+5. `RRFFusionModule` 负责 Dense/Sparse RRF 和多查询候选合并；旧 Fake 只有 `search()` 时由兼容 Adapter 视为已融合通道。
+6. `rerank_knowledge` 只对 Child 文本执行外部 Reranker 打分、阈值过滤和 Top-K 截断。
+7. `select_evidence` 按 `parent_chunk_id` 去重，同一 Parent 命中多个 Child 时保留 `rerank_score` 最高的 Child；生成模型接收 Parent 正文，引用仍指向实际命中的 Child。
+8. Web Search 关闭时，Parent 去重后的知识库证据达到 `RAG_MIN_RELEVANT_DOCUMENTS` 后直接生成，否则返回结构化拒答。
+9. Web Search 开启时，`route` 模块让 LLM 在 `knowledge_base`、`web`、`hybrid` 中选择证据路线。
+10. `web` 和 `hybrid` 路由调用 Tavily。默认只使用规范化原问题搜索一次，以控制费用和延迟。
+11. Web 候选与知识库候选使用同一套 Reranker 准入规则，但 Web 候选不参与 Parent 扩展。
+12. `generate` 根据最终证据生成答案，`validate_citations` 独立校验答案中的 `[n]` 引用。
+13. 无引用、引用越界或重试后仍无有效引用时，返回 `invalid_citations` 拒答。
+14. 查询完成后保存用户消息、助手消息、引用、耗时指标、RAG diagnostics 和审计日志。
+
+## Modular RAG 边界
+
+固定拓扑为：
+
+```text
+preprocess
+-> retrieve
+-> rerank_knowledge
+-> route
+-> optional web_search
+-> optional rerank_web
+-> select_evidence
+-> generate
+-> validate_citations
+```
+
+Pipeline 不读取 MySQL，也不写会话、消息或审计。应用层先从 MySQL 解析授权版本，再构造 `PipelineInput`。内部候选统一使用 `Candidate` 数据类，Provider、旧 Fake 和 diagnostics 边界通过 `from_mapping()` 与 `to_mapping()` 转换，因此 API、数据库 JSON 和测试 Fake 不需要一次性迁移。
+
+模块选择配置如下：
+
+- `RAG_QUERY_MODULE=default`
+- `RAG_RETRIEVER_MODULE=milvus`
+- `RAG_FUSION_MODULE=rrf`
+- `RAG_ROUTER_MODULE=llm`
+- `RAG_SELECTOR_MODULE=route_aware`
+- `RAG_GENERATOR_MODULE=langchain`
+- `RAG_VALIDATOR_MODULE=bracket_citations`
+
+Registry 只接受内置白名单名称。未知模块会在 Pipeline 组装时给出模块类别和名称，不允许通过配置加载任意 Python 路径。
 
 ## 授权不变量
 
@@ -296,7 +339,15 @@ authorized version filter
 核心配置：
 
 ```dotenv
-MILVUS_COLLECTION=enterprise_rag_chunks_hybrid
+CHUNKING_STRATEGY=structure_parent_child
+CHUNK_SIZE=800
+CHUNK_OVERLAP=120
+CHUNK_PARENT_SIZE=2400
+CHUNK_PARENT_OVERLAP=200
+CHUNK_MIN_SIZE=120
+CHUNK_CONTEXT_HEADER_ENABLED=true
+CHUNKING_VERSION=v2
+MILVUS_COLLECTION=enterprise_rag_chunks_parent_child_v2
 RETRIEVAL_MODE=hybrid
 RETRIEVAL_DENSE_LIMIT=10
 RETRIEVAL_SPARSE_LIMIT=10
@@ -305,13 +356,18 @@ RETRIEVAL_RRF_K=60
 
 `RETRIEVAL_MODE` 支持 `dense`、`sparse` 和 `hybrid`。`hybrid` 模式下 dense 与 sparse 两路检索必须使用相同的 `version_uuid in [...]` 授权过滤条件。RRF 融合分数写入候选的 `score`，两路原始分数分别写入 `dense_score` 和 `sparse_score`，命中来源写入 `retrieval_sources`。
 
-从旧 dense-only collection 切换到 hybrid collection 后，需要离线重建索引：
+从旧 collection 切换到 Parent-Child hybrid collection 后，需要从 MinIO
+离线重新解析 active ready 版本：
 
 ```powershell
+.\.venv\Scripts\python.exe scripts\rebuild_hybrid_index.py --dry-run
 .\.venv\Scripts\python.exe scripts\rebuild_hybrid_index.py
 ```
 
-旧 collection 缺少 `sparse_embedding` 字段、content analyzer 或 BM25 function 时，`/health/ready` 会将 Milvus 标记为 unavailable。
+每个版本写入前会按 `version_uuid` 删除目标 collection 中的旧结果，保证
+重建幂等。重建失败不会改变 MySQL active version。旧 collection 缺少
+Parent-Child 字段、`sparse_embedding`、content analyzer 或 BM25 function
+时，`/health/ready` 会将 Milvus 标记为 unavailable，并返回缺失字段摘要。
 
 ## Milvus Chunk 元数据
 
@@ -370,8 +426,14 @@ RETRIEVAL_RRF_K=60
 - `RETRIEVAL_MIN_SCORE`
 - `RETRIEVAL_MAX_CHUNKS_PER_DOCUMENT`
 - `FINAL_CONTEXT_COUNT`
+- `CHUNKING_STRATEGY`
 - `CHUNK_SIZE`
 - `CHUNK_OVERLAP`
+- `CHUNK_PARENT_SIZE`
+- `CHUNK_PARENT_OVERLAP`
+- `CHUNK_MIN_SIZE`
+- `CHUNK_CONTEXT_HEADER_ENABLED`
+- `CHUNKING_VERSION`
 - `MODEL_TIMEOUT_SECONDS`
 - `MODEL_MAX_RETRIES`
 - `RAG_CITATION_RETRY_COUNT`

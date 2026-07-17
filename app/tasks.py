@@ -6,7 +6,7 @@ from sqlalchemy.orm import selectinload
 
 from app.celery_app import celery_app
 from app.db import SessionLocal
-from app.ingestion import build_chunks, parse_document
+from app.ingestion import build_chunks, chunking_metadata, parse_document
 from app.models import (
     Document,
     DocumentVersion,
@@ -82,6 +82,14 @@ def ingest_document(self, job_id: int) -> None:
         inserted = vector_store.insert_chunks(chunks)
         update_job(job_id, JobStatus.activating.value, "activating", 90)
         with SessionLocal() as db:
+            version = db.get(DocumentVersion, version_id)
+            if version is None:
+                raise ValueError("Document version not found")
+            version.metadata_json = {
+                **(version.metadata_json or {}),
+                "chunking": chunking_metadata(),
+            }
+            db.flush()
             activate_version(db, version_id, inserted)
         update_job(job_id, JobStatus.ready.value, "ready", 100)
     except Exception as exc:
